@@ -129,6 +129,9 @@ export async function runHogwartsTask<T>(opts: RunHogwartsTaskOptions<T>): Promi
     info.detail = msg;
     info.finishedAt = Date.now();
     notices.push({ id, text: msg, type: 'error' });
+    // 提示是一闪而过的，用户很可能正待在别的页面。写一条 console.error，
+    // OSContext 会把它收进「系统日志」，事后能翻到失败原因。
+    try { console.error(`[霍格沃茨任务失败] ${opts.label}：${msg}`); } catch { /* 忽略 */ }
     emit();
     return undefined;
   }

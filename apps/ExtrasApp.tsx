@@ -389,6 +389,8 @@ const ExtrasApp: React.FC = () => {
   const mountedAt = useRef(Date.now());
   // 生成/续写跑在模块作用域：切走页面不会中断，回来时已经写好了
   const { running, lastFinished, busy } = useHogwartsTaskKind('extras');
+  // 失败原因要留在页面上：全局 toast 一闪而过，人在别的 App 时根本看不到
+  const lastError = !running && lastFinished?.status === 'error' ? (lastFinished.error || '生成失败') : '';
 
   // 记住浏览位置，下次进来自动回到这一篇
   useEffect(() => {
@@ -573,6 +575,12 @@ const ExtrasApp: React.FC = () => {
             <input type="file" ref={styleInputRef} accept=".json,application/json" onChange={handleImportStyle} className="hidden" />
           </div>
 
+          {lastError && (
+            <div className="rounded-xl border border-red-400/30 px-3 py-2" style={{ background: 'rgba(220,80,80,0.10)' }}>
+              <div className="text-[11px] text-red-200 font-medium">上一篇没写成</div>
+              <div className="text-[10px] text-red-200/70 mt-0.5 leading-relaxed break-words">{lastError}</div>
+            </div>
+          )}
           <button onClick={handleGenerate} disabled={busy}
             className="w-full py-3 rounded-xl bg-amber-400 text-[#0a130f] font-bold text-sm active:scale-95 transition-transform disabled:opacity-50">
             {busy ? '正在执笔……' : '✨ 开始写番外'}
@@ -610,6 +618,22 @@ const ExtrasApp: React.FC = () => {
               className="w-full mt-3 py-2.5 rounded-xl border border-amber-300/40 text-amber-200 text-sm active:scale-95 transition-transform">
               下一章 ▶
             </button>
+          )}
+          {running && (
+            <div className="mt-3 rounded-xl border border-amber-300/30 px-3 py-2 flex items-start gap-2" style={{ background: 'rgba(220,180,60,0.10)' }}>
+              <span className="mt-1 w-1.5 h-1.5 rounded-full bg-amber-300 animate-pulse shrink-0" />
+              <div className="flex-1 min-w-0">
+                <div className="text-[11px] text-amber-200">{running.label}</div>
+                <div className="text-[10px] text-amber-200/60 mt-0.5">{running.detail}　可以切走，回来就在</div>
+              </div>
+            </div>
+          )}
+          {lastError && (
+            <div className="mt-3 rounded-xl border border-red-400/30 px-3 py-2" style={{ background: 'rgba(220,80,80,0.10)' }}>
+              <div className="text-[11px] text-red-200 font-medium">这一章没写成</div>
+              <div className="text-[10px] text-red-200/70 mt-0.5 leading-relaxed break-words">{lastError}</div>
+              <button onClick={() => handleContinue(direction)} className="mt-1.5 px-2 py-1 rounded-lg bg-red-400/20 text-red-100 text-[10px] active:scale-95 transition-transform">重试</button>
+            </div>
           )}
           <div className="mt-3 rounded-xl border border-amber-200/15 p-2.5" style={{ background: 'rgba(255,255,255,0.04)' }}>
             <div className="flex items-center gap-1.5 mb-1.5">

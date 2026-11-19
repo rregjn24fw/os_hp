@@ -21,6 +21,8 @@ export interface HogwartsGenerateOptions {
   userInput: string;
   temperature?: number;
   maxTokens?: number;
+  /** 单次请求超时（毫秒），默认 200 秒。超时会抛错，由任务层变成可见提示。 */
+  timeoutMs?: number;
 }
 
 /** 返回模型文本；失败时抛错，由调用方决定兜底。 */
@@ -48,32 +50,53 @@ export async function hogwartsGenerate(opts: HogwartsGenerateOptions): Promise<s
         { role: 'user', content: opts.userInput },
       ] as any[]);
 
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${cfg.apiKey}`,
-    },
-    body: JSON.stringify({
-      model: cfg.model || opts.globalApi.model,
-      messages,
-      // 温度优先级：调用方显式指定 > 酒馆预设 > 功能级配置 > 默认
-      temperature: opts.temperature ?? style?.temperature ?? cfg.temperature ?? 0.85,
-      max_tokens: cfg.maxTokens ?? opts.maxTokens ?? 2000,
-    }),
-    __sullyMeta: {
-      appId: `hogwarts-${opts.feature}`,
-      appName: '霍格沃茨',
-      purpose: '霍格沃茨主题生成',
-    },
-  } as RequestInit);
+  // 请求超时：不挂 signal 的话，渠道一旦卡住请求会永远悬着——页面上只剩
+  // 「正在续写…」，用户分不清是慢还是失败，数据也永远落不了库。超时抛错，
+  // 由任务层转成可见的错误提示（并写进系统日志），至少知道该重试。
+  const timeoutMs = opts.timeoutMs ?? 200_000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    try { controller.abort(new DOMException(`生成超时（${Math.round(timeoutMs / 1000)} 秒没有响应）`, 'TimeoutError')); } catch { /* 老浏览器不支持 reason */ }
+  }, timeoutMs);
 
-  if (!response.ok) {
-    const detail = await response.text().catch(() => '');
-    throw new Error(`生成失败 (${response.status})：${detail.slice(0, 120)}`);
+  try {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${cfg.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: cfg.model || opts.globalApi.model,
+        messages,
+        // 温度优先级：调用方显式指定 > 酒馆预设 > 功能级配置 > 默认
+        temperature: opts.temperature ?? style?.temperature ?? cfg.temperature ?? 0.85,
+        max_tokens: cfg.maxTokens ?? opts.maxTokens ?? 2000,
+      }),
+      signal: controller.signal,
+      __sullyMeta: {
+        appId: `hogwarts-${opts.feature}`,
+        appName: '霍格沃茨',
+        purpose: '霍格沃茨主题生成',
+      },
+    } as RequestInit);
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(`生成失败 (${response.status})：${detail.slice(0, 120)}`);
+    }
+    const data = await safeResponseJson(response);
+    const content = data.choices?.[0]?.message?.content;
+    if (typeof content !== 'string' || !content.trim()) {
+      throw new Error('模型返回了空内容（多半是被 max_tokens 截断或渠道只回了思考过程），可以重试或把字数调小');
+    }
+    return content.trim();
+  } catch (e: any) {
+    if (controller.signal.aborted) {
+      throw new Error(`生成超时（${Math.round(timeoutMs / 1000)} 秒没有响应），换个时间或换个渠道再试`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
   }
-  const data = await safeResponseJson(response);
-  const content = data.choices?.[0]?.message?.content;
-  if (typeof content !== 'string' || !content.trim()) throw new Error('模型未返回有效内容');
-  return content.trim();
 }
