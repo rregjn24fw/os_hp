@@ -1463,7 +1463,23 @@ export const describeStoryApiError = (status: number, data: unknown): string => 
 export const isStoryUserLastCompatibilityError = (message: string): boolean => (
     /(?:last|final)[^\n]{0,80}(?:message|role)[^\n]{0,80}user/i.test(message)
     || /(?:最后|末尾)[^\n]{0,40}(?:消息|角色)[^\n]{0,40}user/i.test(message)
+    || isStoryAssistantPrefillRejection(message)
 );
+
+/**
+ * 渠道拒绝「助手预填」请求（最后一条是 assistant 的续写）。
+ *
+ * 阿里云百炼 / DashScope 系的中转就是这么报错的：`The request failed because it
+ * is missing 'partial' parameter.` —— 它要求显式带 `partial: true` 才允许最后一条
+ * 消息是助手，语义是「接着这段助手文本往下写」。OpenAI 官方接口反而会因为这个
+ * 未知字段直接 400，所以这个参数只能在撞到这条错误时补发，不能提前塞进所有请求。
+ */
+export const isStoryAssistantPrefillRejection = (message: string): boolean => (
+    /partial/i.test(message) && /(?:missing|required?|need|缺少|必须|应当|需要)/i.test(message)
+);
+
+/** 400 时是否值得补 `partial: true` 重发一次（预填被拒，且渠道点名了 partial）。 */
+export const isStoryPrefillCompatRetryable = (message: string): boolean => isStoryAssistantPrefillRejection(message);
 
 /** 200 但正文为空时把 finish_reason 带出来，区分截断、内容过滤和代理空包。 */
 export const describeEmptyStoryCompletion = (data: unknown): string => {

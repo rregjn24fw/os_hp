@@ -34,6 +34,7 @@ import {
     getActiveStoryMiniTheaterPrompt,
     getPendingStoryRetryInput,
     isStoryUserLastCompatibilityError,
+    isStoryPrefillCompatRetryable,
     makeStoryTheaterId,
     makeStoryTheaterFileName,
     createStoryTheaterMirrorMessage,
@@ -478,13 +479,23 @@ const StoryTheaterSession: React.FC<Props> = ({ entry, preset, masks, onBack, on
         purpose = '剧情见面生成',
     ): Promise<string> => {
         const generationSettings = prepareStoryGenerationSettings(settings, entry.omitSamplingParams === true);
-        const response = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+        const post = (extra?: Record<string, unknown>) => fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
-            body: JSON.stringify({ model: apiConfig.model, messages: payload, stream: false, ...generationSettings }),
+            body: JSON.stringify({ model: apiConfig.model, messages: payload, stream: false, ...generationSettings, ...(extra || {}) }),
             __sullyMeta: { appId: 'date', appName: '见面', ...theaterCharMeta, purpose },
         } as RequestInit);
-        const data = await safeResponseJson(response);
+        let response = await post();
+        let data = await safeResponseJson(response);
+        // 预填请求（最后一条是 assistant）在百炼/DashScope 系中转上会被拒：
+        // “missing `partial` parameter”。它要求显式带 partial: true 才允许接着助手开头往下写。
+        // 只在真的撞到这条错误时补参数重发一次——OpenAI 官方接口会把未知字段当成 400，
+        // 提前塞进去反而会让本来正常的渠道挂掉。
+        if (!response.ok && response.status === 400 && payload[payload.length - 1]?.role === 'assistant'
+            && isStoryPrefillCompatRetryable(describeStoryApiError(response.status, data))) {
+            response = await post({ partial: true });
+            data = await safeResponseJson(response);
+        }
         if (!response.ok) throw new Error(describeStoryApiError(response.status, data));
         const reportedPromptTokens = Number(data?.usage?.prompt_tokens);
         if (Number.isFinite(reportedPromptTokens) && reportedPromptTokens > 0) onPromptTokens?.(reportedPromptTokens);
@@ -810,7 +821,7 @@ const StoryTheaterSession: React.FC<Props> = ({ entry, preset, masks, onBack, on
                 isOpaqueBrowserFailure
                     ? '剧情请求被上游/网关断开，浏览器读不到真实错误。若陪伴原版同 API 正常，可在剧情设置尝试“不发送高级采样参数”或“400 兼容模式”；请求差异已写入 Network 日志，请勿连续重发。'
                     : message.includes('API Error 400') && isStoryUserLastCompatibilityError(message) && !entry.forceUserLastMessage
-                    ? '剧情续写失败：API 400。若日志提示最后一条必须是 user，可在右上角设置开启“400 兼容模式”；更建议更换模型。'
+                    ? '剧情续写失败：API 400。该渠道不接受「助手预填 / 结尾是 assistant」的请求，可在右上角设置开启“400 兼容模式”后重试；更建议换一个模型。'
                     : `剧情续写失败：${message}`,
                 'error',
             );

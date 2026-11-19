@@ -31,6 +31,8 @@ import {
     getPendingStoryRetryInput,
     isProtectedStoryPrompt,
     isStoryUserLastCompatibilityError,
+    isStoryAssistantPrefillRejection,
+    isStoryPrefillCompatRetryable,
     storyTimelineTimestampForCharacter,
     parseStoryDisplayBlocks,
     parseStoryMiniTheater,
@@ -60,6 +62,20 @@ describe('剧情接口报错诊断', () => {
         expect(isStoryUserLastCompatibilityError('API Error 400: final message role must be user')).toBe(true);
         expect(isStoryUserLastCompatibilityError('API Error 400：最后一条消息必须是 user')).toBe(true);
         expect(isStoryUserLastCompatibilityError('API Error 400: context_length_exceeded')).toBe(false);
+    });
+
+    it('百炼系「缺少 partial 参数」算预填被拒，需要补 partial 重发', () => {
+        // 真实报错（慧慧云中转 → DashScope）：最后一条是 assistant 时必须带 partial: true
+        const real = 'API Error 400：The request failed because it is missing `partial` parameter. Request id: 021795087588432';
+        expect(isStoryAssistantPrefillRejection(real)).toBe(true);
+        expect(isStoryPrefillCompatRetryable(real)).toBe(true);
+        // 同样属于「末条角色不被接受」，所以文案要引导用户开 400 兼容模式
+        expect(isStoryUserLastCompatibilityError(real)).toBe(true);
+        expect(isStoryAssistantPrefillRejection('API Error 400: partial 参数缺少')).toBe(true);
+        // 只是提到了 partial 但不是在说缺参数，不该误判
+        expect(isStoryAssistantPrefillRejection('API Error 400: invalid api key')).toBe(false);
+        expect(isStoryAssistantPrefillRejection('API Error 500: upstream partial failure')).toBe(false);
+        expect(isStoryPrefillCompatRetryable('API Error 400: context_length_exceeded')).toBe(false);
     });
 
     it('空正文会暴露 finish_reason，而不是统一叫用户盲目重试', () => {
