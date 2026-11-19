@@ -246,6 +246,15 @@ const TypewriterSegments: React.FC<{
 };
 
 // --- Segment Bubble (game dialogue style — warm neutral) ---
+// 【显示层清洗】AI 开场偶尔会把【1. xxx】【2. xxx】选项直接写进 GM 叙事；原设计选项由玩家出题，
+// 这里只删这类选项串和紧跟的「---…选择…」提示句，其余文本原样保留。
+const stripInlineOptions = (text: string): string =>
+    text
+        .replace(/(?:\s*【\s*[0-9０-９]{1,2}\s*[.、,，:：]\s*[^】]{1,40}】)+/g, '')
+        .replace(/\s*[-—－]{2,}\s*[^\n。]{0,14}选择[^\n。]{0,16}[。.]?/g, '')
+        .replace(/[ \t]{2,}/g, ' ')
+        .trim();
+
 const SegmentBubble: React.FC<{ seg: { speaker: string; text: string }; charName: string }> = ({ seg, charName }) => (
     <div className="animate-fade-in">
         {seg.speaker === 'gm' ? (
@@ -752,11 +761,11 @@ const GuidebookApp: React.FC = () => {
 
             const segments = rawSegs?.filter((s: any) => s && (typeof s.text === 'string' || typeof s.content === 'string'));
             if (segments && segments.length > 0) {
-                // Normalize: accept text or content field, speaker/role field
+                // Normalize: accept text or content field, speaker/role field; strip stray option markers
                 const cleaned = segments.map((s: any) => ({
                     speaker: (s.speaker === 'char' || s.role === 'char') ? 'char' : 'gm',
-                    text: String(s.text || s.content || ''),
-                }));
+                    text: stripInlineOptions(String(s.text || s.content || '')),
+                })).filter((s: { speaker: string; text: string }) => s.text.length > 0);
                 setOpeningSegments(cleaned);
                 const updated = { ...newSession, openingSequence: JSON.stringify(cleaned) };
                 setSession(updated);
