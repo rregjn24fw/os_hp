@@ -2,16 +2,18 @@
  * 彼豆故事集（番外生成器）——基于霍格沃茨角色生成番外短篇。
  * 支持导出干净可读的 TXT 与 EPUB（fflate 打包，正文为纯文学散文，无 markdown/代码痕迹）。
  */
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { useOS } from '../context/OSContext';
 import { hogwartsGenerate } from '../utils/hogwartsGenerate';
+import { runHogwartsTask, useHogwartsTaskKind } from '../utils/hogwartsTasks';
 import {
   loadExtrasStories, saveExtrasStories, parseExtrasGeneration, sanitizeProse,
   loadStylePreset, saveStylePreset, clearStylePreset, type ExtrasStory,
 } from '../utils/hogwarts';
 import { parseSillyTavernPreset } from '../utils/sillyTavernPreset';
 import { HOUSE_META } from '../utils/hogwarts';
-import type { HouseId } from '../types';
+import { characterEra, ERA_SPOILER_NOTE } from '../utils/hogwartsEras';
+import type { HouseId, CharacterProfile } from '../types';
 
 const LENGTH_OPTIONS = [
   { id: 'short', label: '短篇 · 1章', chapters: 1 },
@@ -19,7 +21,37 @@ const LENGTH_OPTIONS = [
   { id: 'long', label: '长篇 · 5章', chapters: 5 },
 ];
 
-function buildContinuePrompt(story: ExtrasStory, eraHint?: string): string {
+/** 「随机」按钮用的题材灵感（不指定主题时也能开写）。 */
+export const RANDOM_TOPICS = [
+  '魁地奇决赛前夜，更衣室里只有两个人',
+  '第一次去霍格莫德，结果跟丢了同伴',
+  '和幽灵打的一个赌，输的人要去禁林',
+  '图书馆闭馆后被困在禁书区',
+  '一场魔药事故，把两个人变成了一对',
+  '午夜的天文塔，谁都不肯先说出口',
+  '圣诞舞会前三天，礼服被施了恶咒',
+  '有人在公共休息室的壁炉里塞了一封匿名信',
+  '黑湖结冰的第一天，湖面上出现了脚印',
+  '一把会认主的旧扫帚，谁都飞不起来',
+];
+
+/** 「随机」续写方向：给 AI 一个转折钩子，而不是让它重复上一章。 */
+export const RANDOM_DIRECTIONS = [
+  '引入一个不速之客，打破现在的平衡',
+  '让主角藏了很久的秘密被意外戳破',
+  '把场景换到一个更危险的地方（禁林、地下室、禁书区）',
+  '让两人为了同一件事吵起来，谁也不肯先低头',
+  '出现一封不该出现的信或一件来历不明的物品',
+  '时间跳到一个季节之后，事情已经变样',
+  '让一个配角成为这一章的关键，主角反而被动',
+  '一场突如其来的意外逼主角做出选择',
+  '把之前的某个小细节翻出来，变成这一章的转折',
+  '安静的一章：什么都没发生，但两人之间变了',
+];
+
+const pickRandom = <T,>(arr: T[]): T => arr[Math.floor(Math.random() * arr.length)];
+
+function buildContinuePrompt(story: ExtrasStory, eraHint?: string, direction?: string): string {
   const prev = story.chapters
     .map((c, i) => `第${i + 1}章 ${c.title || ''}\n${c.content}`)
     .join('\n\n');
@@ -34,7 +66,10 @@ ${prev}
 
 ### 续写要求
 1. 顺着已有情节自然续写第 ${story.chapters.length + 1} 章，衔接上一章结尾，剧情继续推进，不要重复已有内容。
-2. 本章正文约 900 字，有场景、有对话、有推进。
+${direction
+  ? `2. **这一章要往这个方向走**：${direction}。请把它当成剧情骨架自然实现，不要生硬点题，也不要只是复述这句话。`
+  : '2. 方向由你自己判断：挑一个最能推动人物关系、又不落俗套的走向，可以引入一个新的转折。'}
+3. 本章正文约 900 字，有场景、有对话、有推进。
 3. ${PROSE_RULES}
 4. 严格输出 JSON，不要输出任何其他内容：
 \`\`\`json
@@ -216,22 +251,163 @@ ${chapterFiles.map((c, i) => `    <navPoint id="np${i + 1}" playOrder="${i + 1}"
   }).catch(() => { /* fflate 加载失败静默 */ });
 }
 
+// ── 后台任务：生成 / 续写（跑在模块作用域，切页面也不中断，结果直接落库） ──
+
+interface ExtrasDeps {
+  apiConfig: any;
+  userProfile: any;
+  characters: CharacterProfile[];
+}
+
+const LAST_STORY_KEY = 'hogwarts_extras_last_story';
+const SESSION_KEY = 'hogwarts_extras_session';
+
+interface ExtrasSession {
+  view: 'list' | 'create' | 'read';
+  storyId?: string;
+  chapterIdx?: number;
+}
+
+function loadSession(): ExtrasSession {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (raw) return JSON.parse(raw) as ExtrasSession;
+  } catch { /* 忽略损坏的会话 */ }
+  return { view: 'list' };
+}
+
+function saveSession(s: ExtrasSession) {
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify(s)); } catch { /* 忽略 */ }
+}
+
+function lastStoryId(): string | null {
+  try { return localStorage.getItem(LAST_STORY_KEY); } catch { return null; }
+}
+
+function markLastStory(id: string) {
+  try { localStorage.setItem(LAST_STORY_KEY, id); } catch { /* 忽略 */ }
+}
+
+async function generateExtrasStory(
+  deps: ExtrasDeps,
+  opts: { char: CharacterProfile; topic: string; chapters: number; words: number },
+): Promise<ExtrasStory> {
+  const house = (opts.char as any).houseId as HouseId | undefined;
+  const own = characterEra(opts.char);
+  const eraHint = [
+    house ? `角色属于${HOUSE_META[house].cn}学院` : '',
+    own !== 'any' ? ERA_SPOILER_NOTE[own] : '',
+  ].filter(Boolean).join('；');
+  const raw = await hogwartsGenerate({
+    feature: 'extras', globalApi: deps.apiConfig,
+    char: opts.char,
+    userProfile: deps.userProfile,
+    instructions: buildExtrasPrompt({
+      charName: opts.char.name,
+      topic: opts.topic,
+      chapterCount: opts.chapters,
+      wordsPer: opts.words,
+      eraHint,
+    }),
+    userInput: `请以 ${opts.char.name} 为主角，写一篇${opts.chapters}章的番外${opts.topic ? `，主题：${opts.topic}` : ''}，每章约${opts.words}字。`,
+    maxTokens: Math.max(2000, Math.ceil(opts.words * 1.8) * opts.chapters),
+  });
+  const parsed = parseExtrasGeneration(raw, opts.char.name);
+  const story: ExtrasStory = {
+    id: `extra-${Date.now()}`,
+    title: parsed.title,
+    charId: opts.char.id,
+    charName: opts.char.name,
+    topic: opts.topic || undefined,
+    chapters: parsed.chapters.map(c => ({ title: c.title, content: sanitizeProse(c.content) })),
+    createdAt: Date.now(),
+  };
+  // 立即存档：任务完成的那一刻数据就已经在本地了，和组件是否还活着无关
+  saveExtrasStories([story, ...loadExtrasStories()]);
+  markLastStory(story.id);
+  return story;
+}
+
+async function continueExtrasStory(deps: ExtrasDeps, storyId: string, direction?: string): Promise<ExtrasStory> {
+  const story = loadExtrasStories().find(s => s.id === storyId);
+  if (!story) throw new Error('这篇番外已经不在故事集里了');
+  const storyChar = deps.characters.find(c => c.id === story.charId);
+  const house = (storyChar as any)?.houseId as HouseId | undefined;
+  const own = storyChar ? characterEra(storyChar) : 'any';
+  const eraHint = [
+    house ? `角色属于${HOUSE_META[house].cn}学院` : '',
+    own !== 'any' ? ERA_SPOILER_NOTE[own] : '',
+  ].filter(Boolean).join('；');
+  const raw = await hogwartsGenerate({
+    feature: 'extras', globalApi: deps.apiConfig,
+    char: deps.characters.find(c => c.id === story.charId),
+    userProfile: deps.userProfile,
+    instructions: buildContinuePrompt(story, eraHint, direction),
+    userInput: direction
+      ? `请为《${story.title}》续写第 ${story.chapters.length + 1} 章，方向：${direction}`
+      : `请为《${story.title}》续写第 ${story.chapters.length + 1} 章，方向你定。`,
+    maxTokens: 2500,
+  });
+  const parsed = parseExtrasGeneration(raw, story.charName);
+  const chapter = {
+    title: parsed.chapters[0]?.title || `第${story.chapters.length + 1}章`,
+    content: sanitizeProse(parsed.chapters[0]?.content || ''),
+  };
+  if (!chapter.content) throw new Error('模型未返回有效正文');
+  const updated: ExtrasStory = { ...story, chapters: [...story.chapters, chapter] };
+  // 以最新存档为基准替换，避免覆盖生成期间的其他改动
+  saveExtrasStories(loadExtrasStories().map(s => s.id === updated.id ? updated : s));
+  markLastStory(updated.id);
+  return updated;
+}
+
 // ── 页面 ─────────────────────────────────────────────────────────────
 
 const ExtrasApp: React.FC = () => {
   const { closeApp, characters, apiConfig, userProfile, addToast } = useOS();
   const [stories, setStories] = useState<ExtrasStory[]>(() => loadExtrasStories());
-  const [view, setView] = useState<'list' | 'create' | 'read'>('list');
+  // 会话恢复：上次停在哪一篇、第几章，回来就还在那一页
+  const initialSession = useRef(loadSession()).current;
+  const [view, setView] = useState<'list' | 'create' | 'read'>(() => {
+    const s = initialSession;
+    if (s.view === 'read' && s.storyId && loadExtrasStories().some(x => x.id === s.storyId)) return 'read';
+    if (s.view === 'create') return 'create';
+    return 'list';
+  });
   const [charId, setCharId] = useState('');
   const [topic, setTopic] = useState('');
   const [lengthId, setLengthId] = useState('short');
   const [wordsPer, setWordsPer] = useState(900);
-  const [busy, setBusy] = useState(false);
-  const [reading, setReading] = useState<ExtrasStory | null>(null);
-  const [chapterIdx, setChapterIdx] = useState(0);
+  const [direction, setDirection] = useState('');
+  const [reading, setReading] = useState<ExtrasStory | null>(() => {
+    if (!initialSession.storyId) return null;
+    return loadExtrasStories().find(x => x.id === initialSession.storyId) || null;
+  });
+  const [chapterIdx, setChapterIdx] = useState(() => initialSession.chapterIdx || 0);
   const [stylePreset, setStylePreset] = useState(() => loadStylePreset());
   const styleInputRef = useRef<HTMLInputElement>(null);
-  const genRef = useRef(0);
+  const mountedAt = useRef(Date.now());
+  // 生成/续写跑在模块作用域：切走页面不会中断，回来时已经写好了
+  const { running, lastFinished, busy } = useHogwartsTaskKind('extras');
+
+  // 记住浏览位置，下次进来自动回到这一篇
+  useEffect(() => {
+    saveSession({ view, storyId: reading?.id, chapterIdx });
+  }, [view, reading?.id, chapterIdx]);
+
+  // 后台写完（哪怕是在别的页面完成的）→ 读回故事集，翻到最新一章
+  useEffect(() => {
+    if (!lastFinished?.finishedAt) return;
+    const all = loadExtrasStories();
+    setStories(all);
+    if (lastFinished.finishedAt < mountedAt.current) return; // 老任务不抢视线
+    const target = all.find(s => s.id === lastStoryId());
+    if (target) {
+      setReading(target);
+      setChapterIdx(Math.max(0, target.chapters.length - 1));
+      setView('read');
+    }
+  }, [lastFinished?.id]);
 
   const selectedChar = characters.find(c => c.id === charId);
   const persist = (s: ExtrasStory[]) => { saveExtrasStories(s); setStories(s); };
@@ -267,51 +443,23 @@ const ExtrasApp: React.FC = () => {
     addToast('已清除文风预设，恢复默认文风', 'success');
   };
 
-  const handleGenerate = async () => {
+  const handleGenerate = () => {
     if (busy) return;
     if (!selectedChar) { addToast('请先选择一位角色', 'error'); return; }
-    setBusy(true);
-    const gen = ++genRef.current;
-    try {
-      const len = LENGTH_OPTIONS.find(l => l.id === lengthId) || LENGTH_OPTIONS[0];
-      const words = Math.min(Math.max(Math.round(wordsPer) || 900, 300), 4000);
-      const house = (selectedChar as any).houseId as HouseId | undefined;
-      const eraHint = house ? `角色属于${HOUSE_META[house].cn}学院` : '';
-      const raw = await hogwartsGenerate({
-        feature: 'extras', globalApi: apiConfig as any,
-        char: selectedChar,
-        userProfile: userProfile as any,
-        instructions: buildExtrasPrompt({
-          charName: selectedChar.name,
-          topic: topic.trim(),
-          chapterCount: len.chapters,
-          wordsPer: words,
-          eraHint,
-        }),
-        userInput: `请以 ${selectedChar.name} 为主角，写一篇${len.chapters}章的番外${topic.trim() ? `，主题：${topic.trim()}` : ''}，每章约${words}字。`,
-        maxTokens: Math.max(2000, Math.ceil(words * 1.8) * len.chapters),
-      });
-      if (gen !== genRef.current) return;
-      const parsed = parseExtrasGeneration(raw, selectedChar.name);
-      const story: ExtrasStory = {
-        id: `extra-${Date.now()}`,
-        title: parsed.title,
-        charId: selectedChar.id,
-        charName: selectedChar.name,
-        topic: topic.trim() || undefined,
-        chapters: parsed.chapters.map(c => ({ title: c.title, content: sanitizeProse(c.content) })),
-        createdAt: Date.now(),
-      };
-      persist([story, ...loadExtrasStories()]);
-      setReading(story);
-      setChapterIdx(0);
-      setView('read');
-      addToast(`《${story.title}》已收录进故事集`, 'success');
-    } catch (e: any) {
-      addToast(e?.message || '生成失败', 'error');
-    } finally {
-      if (gen === genRef.current) setBusy(false);
-    }
+    const len = LENGTH_OPTIONS.find(l => l.id === lengthId) || LENGTH_OPTIONS[0];
+    const words = Math.min(Math.max(Math.round(wordsPer) || 900, 300), 4000);
+    const char = selectedChar;
+    const t = topic.trim();
+    // 请求跑在后台任务层：写完直接落库，切换页面不丢
+    void runHogwartsTask({
+      kind: 'extras',
+      label: `彼豆故事集 · 写《${char.name}》的番外`,
+      notice: r => `《${r.title}》已写进故事集`,
+      run: () => generateExtrasStory(
+        { apiConfig, userProfile, characters },
+        { char, topic: t, chapters: len.chapters, words },
+      ),
+    });
   };
 
   const handleDelete = (id: string) => {
@@ -319,40 +467,17 @@ const ExtrasApp: React.FC = () => {
     if (reading?.id === id) { setReading(null); setView('list'); }
   };
 
-  /** 续写下一章：以已有全部章节为上下文，生成后追加进同一篇并自动存档。 */
-  const handleContinue = async () => {
+  /** 续写下一章：可指定方向，也可留空让 AI 自己找；写完自动并入同一篇并存档。 */
+  const handleContinue = (dir?: string) => {
     if (!reading || busy) return;
-    setBusy(true);
-    const gen = ++genRef.current;
-    try {
-      const house = (characters.find(c => c.id === reading.charId) as any)?.houseId as HouseId | undefined;
-      const eraHint = house ? `角色属于${HOUSE_META[house].cn}学院` : '';
-      const raw = await hogwartsGenerate({
-        feature: 'extras', globalApi: apiConfig as any,
-        char: characters.find(c => c.id === reading.charId),
-        userProfile: userProfile as any,
-        instructions: buildContinuePrompt(reading, eraHint),
-        userInput: `请为《${reading.title}》续写第 ${reading.chapters.length + 1} 章。`,
-        maxTokens: 2500,
-      });
-      if (gen !== genRef.current) return;
-      const parsed = parseExtrasGeneration(raw, reading.charName);
-      const chapter = {
-        title: parsed.chapters[0]?.title || `第${reading.chapters.length + 1}章`,
-        content: sanitizeProse(parsed.chapters[0]?.content || ''),
-      };
-      if (!chapter.content) throw new Error('模型未返回有效正文');
-      const updated: ExtrasStory = { ...reading, chapters: [...reading.chapters, chapter] };
-      // 自动存档：同步进本地故事集
-      persist(loadExtrasStories().map(s => s.id === updated.id ? updated : s));
-      setReading(updated);
-      setChapterIdx(updated.chapters.length - 1);
-      addToast(`第${updated.chapters.length}章已续写并存档`, 'success');
-    } catch (e: any) {
-      addToast(e?.message || '续写失败', 'error');
-    } finally {
-      if (gen === genRef.current) setBusy(false);
-    }
+    const storyId = reading.id;
+    const direction = (dir ?? '').trim();
+    void runHogwartsTask({
+      kind: 'extras',
+      label: `彼豆故事集 · 续写《${reading.title}》`,
+      notice: r => `《${r.title}》已续写到第 ${r.chapters.length} 章`,
+      run: () => continueExtrasStory({ apiConfig, userProfile, characters }, storyId, direction || undefined),
+    });
   };
 
   const openStory = (s: ExtrasStory) => { setReading(s); setChapterIdx(0); setView('read'); };
@@ -398,6 +523,13 @@ const ExtrasApp: React.FC = () => {
                 </button>
               );
             })}
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="text-[11px] text-amber-200/60 flex-1">主题（留空 = 让 AI 自己找）</span>
+            <button onClick={() => setTopic(pickRandom(RANDOM_TOPICS))}
+              className="px-2 py-1 rounded-lg bg-white/5 border border-amber-200/20 text-[10px] text-amber-200 active:scale-95 transition-transform">
+              🎲 随机灵感
+            </button>
           </div>
           <textarea value={topic} onChange={e => setTopic(e.target.value)} rows={3}
             placeholder="番外主题（可选）：比如「魁地奇决赛前夜」「第一次去霍格莫德」「和幽灵的一场赌局」"
@@ -479,9 +611,21 @@ const ExtrasApp: React.FC = () => {
               下一章 ▶
             </button>
           )}
-          <button onClick={handleContinue} disabled={busy}
+          <div className="mt-3 rounded-xl border border-amber-200/15 p-2.5" style={{ background: 'rgba(255,255,255,0.04)' }}>
+            <div className="flex items-center gap-1.5 mb-1.5">
+              <span className="text-[11px] text-amber-200/60 flex-1">接下来往哪个方向写？</span>
+              <button onClick={() => setDirection(pickRandom(RANDOM_DIRECTIONS))}
+                className="px-2 py-1 rounded-lg bg-white/5 border border-amber-200/20 text-[10px] text-amber-200 active:scale-95 transition-transform">
+                🎲 随机
+              </button>
+            </div>
+            <textarea value={direction} onChange={e => setDirection(e.target.value)} rows={2}
+              placeholder="留空 = 让 AI 自己决定走向"
+              className="w-full rounded-lg px-2.5 py-2 text-xs bg-black/25 border border-amber-200/15 text-amber-50 placeholder:text-amber-200/30 focus:outline-none resize-none" />
+          </div>
+          <button onClick={() => handleContinue(direction)} disabled={busy}
             className="w-full mt-2 py-3 rounded-xl bg-amber-400 text-[#0a130f] font-bold text-sm active:scale-95 transition-transform disabled:opacity-50">
-            {busy ? '正在续写……' : '✍ 续写下一章'}
+            {busy ? (running?.detail ? `正在续写…` : '正在续写……') : '✍ 续写下一章'}
           </button>
         </div>
       </div>

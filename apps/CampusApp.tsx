@@ -5,8 +5,12 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { useOS } from '../context/OSContext';
 import { hogwartsGenerate } from '../utils/hogwartsGenerate';
+import { runHogwartsTask, useHogwartsTaskKind } from '../utils/hogwartsTasks';
 import {
-  HOUSE_META, HOUSE_IDS, defaultCampusState, loadCampusState, saveCampusState,
+  eraNpcPool, eraProfessorFor, filterCharactersByEra, castHintOf, ERA_SPOILER_NOTE,
+} from '../utils/hogwartsEras';
+import {
+  HOUSE_META, HOUSE_IDS, FORUM_ERAS, defaultCampusState, loadCampusState, saveCampusState,
   awardHousePoints, nextCampusPeriod, parseSceneMessages,
 } from '../utils/hogwarts';
 import type { HouseId, CampusState, CharacterProfile } from '../types';
@@ -19,28 +23,154 @@ const ACTIVITIES: Record<string, string[]> = {
 };
 const PERIOD_LABEL = { morning: '🌅 上午', afternoon: '☀️ 下午', evening: '🌙 晚上' };
 
-/** 按课程/活动定教授（讲课时在场的权威人物）。 */
-function professorFor(activity: string): { name: string; style: string } {
-  const map: Record<string, { name: string; style: string }> = {
-    '魔咒课': { name: '弗立维教授', style: '尖嗓子、爱点头满意，偶尔激动到用茶杯当教鞭' },
-    '变形术课': { name: '麦格教授', style: '严厉精准，眼神能钉住走神的人，讨厌不守纪律' },
-    '魔药课': { name: '斯内普教授', style: '冷嘲热讽、压低声音点名刁难，扣分毫不留情' },
-    '草药课': { name: '斯普劳特教授', style: '热情大嗓门，满手泥土，护着胆小的学生' },
-    '魔法史课': { name: '宾斯教授', style: '幽灵，念稿子一般无起伏，全班昏昏欲睡' },
-    '黑魔法防御术课': { name: '卢平教授', style: '温和幽默，善用实际案例，学生最喜欢他的课' },
-    '占卜课': { name: '特里劳妮教授', style: '神秘兮兮、大惊小怪，爱预言不祥' },
-    '保护神奇生物课': { name: '海格', style: '豪爽热情，总觉得危险的生物很可爱' },
-    '决斗俱乐部': { name: '斯内普教授', style: '挑剔动作规范，随时拆台' },
-    '魁地奇训练': { name: '霍琦夫人', style: '干脆利落，哨声一响绝不啰嗦' },
-    '天文课观星': { name: '辛尼斯塔教授', style: '安静沉稳，在塔顶吹着夜风点名' },
-  };
-  if (map[activity]) return map[activity];
-  return { name: '级长', style: '负责维持秩序的学生领袖' };
+/** 按课程/活动定教授（讲课时在场的权威人物）；时代不同，教授阵容不同。 */
+function professorFor(activity: string, era: string = 'auto'): { name: string; style: string } {
+  return eraProfessorFor(activity, era);
+}
+
+/** 校园时间线的持久化（与论坛时代独立，避免互相污染）。 */
+const CAMPUS_ERA_KEY = 'hogwarts_campus_era';
+const CAMPUS_CAST_KEY = 'hogwarts_campus_cast';
+
+function loadCampusEra(): string {
+  try { return localStorage.getItem(CAMPUS_ERA_KEY) || 'auto'; } catch { return 'auto'; }
+}
+function saveCampusEra(id: string) {
+  try { localStorage.setItem(CAMPUS_ERA_KEY, id); } catch { /* 忽略 */ }
+}
+/** 玩家指定的出场角色 id 列表；空数组表示「让 TA 按时代自动挑」。 */
+function loadCampusCast(): string[] {
+  try {
+    const raw = localStorage.getItem(CAMPUS_CAST_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr.map(String) : [];
+  } catch { return []; }
+}
+function saveCampusCast(ids: string[]) {
+  try { localStorage.setItem(CAMPUS_CAST_KEY, JSON.stringify(ids)); } catch { /* 忽略 */ }
 }
 
 type CampusMessage = NonNullable<CampusState['messages']>[number];
 
 const QUICK_ACTIONS = ['认真听讲做笔记', '举手回答问题', '和同桌咬耳朵吐槽', '偷偷打瞌睡', '故意捣乱引全班大笑', '向教授提一个问题'];
+
+interface CampusDeps {
+  apiConfig: any;
+  characters: CharacterProfile[];
+  userProfile: any;
+}
+
+/** 从一个存档快照拼出这一轮群像演绎的指令（含时代隔离与玩家指定出场角色）。 */
+function buildSceneInstruction(
+  state: CampusState,
+  kind: 'class' | 'advance',
+  userAction: string | null,
+  era: string,
+  cast: CharacterProfile[],
+): string {
+  const prof = professorFor(state.activity, era);
+
+  // 玩家点名的角色（按时代过滤过）+ 该时代的 NPC 池，其余路人由模型自行生成
+  const castLines = cast
+    .map(c => castHintOf(c, id => (id ? HOUSE_META[id].cn : '')))
+    .filter(Boolean);
+  const eraPool = eraNpcPool(era).map(n => `${n.name}（${HOUSE_META[n.houseId].cn}，${n.persona}）`);
+  const roaster = [...castLines, ...eraPool].join('、');
+  const spoiler = era === 'auto' ? '' : `\n### 时代铁律\n${ERA_SPOILER_NOTE[era as keyof typeof ERA_SPOILER_NOTE] || ''}`;
+
+  return `你在运营一个「霍格沃茨沉浸式校园群像演绎」，风格参考酒馆角色扮演：真人感、群像、鲜活。
+当前场景：第 ${state.day} 天 ${PERIOD_LABEL[state.period]} · ${state.location} · ${state.activity}
+在场权威人物：${prof.name}（${prof.style}）
+用户学院：${HOUSE_META[state.houseId].cn}${spoiler}
+
+### 在场同学池（从中挑 2-3 位出场，必须符合各自性格）
+${roaster}
+
+### 出场规矩
+1. 优先让上面「在场同学池」里的角色说话；需要撑场面时可以加 1-2 个没列出的同班路人（自己起名字，只做背景反应，不要抢戏）。
+2. ${castLines.length > 0 ? '玩家点名要出场的角色必须至少有一位开口。' : '没有点名的角色时，从池子里随机挑选，别总是同几个人。'}
+3. 角色台词要符合各自的人设；不要凭空冒出不属于这个世界或不属于这个时间线的人。
+
+### 本轮要求
+${kind === 'advance'
+  ? '用户跳过/推进时段。先用 1-2 条旁白描写时间流逝和场景切换（下一节课或课间），再安排教授开场和 2-3 位同学的鲜活吐槽（传纸条、偷偷抱怨作业多、抢座位之类）——要像真的在学校。'
+  : `用户刚做了一个行动或说了一句话：「${userAction}」。\n1. 用 1 条旁白描写这个动作的即时后果（周围人的目光、声响、细节）。\n2. 教授做出反应（点名、评价、扣分/加分）。\n3. 至少 2 位在场同学用符合性格的口吻吐槽或起哄（可以带（小声）（传纸条）（憋笑）这类动作括注）。\n4. 结尾留一个钩子，让用户想继续。`}
+台词要短而真实，像真人说话，不要书面腔。剧情走向遵循哈利波特世界观。
+
+严格输出 JSON 数组（3-5 条消息），不要输出其他内容：
+\`\`\`json
+[
+  {"role":"narration","speaker":"GM","text":"旁白描写"},
+  {"role":"professor","speaker":"${prof.name}","text":"教授的话"},
+  {"role":"npc","speaker":"${cast[0]?.name || eraNpcPool(era)[0].name}","houseId":"gryffindor","text":"（小声）…"}
+]
+\`\`\`
+角色 role 只能是 narration / professor / npc。`;
+}
+
+/**
+ * 跑一轮群像演绎并落库。
+ * 整个函数在模块作用域执行：请求期间切走页面（组件卸载）也不会中断，
+ * 完成时直接写 localStorage，回到校园页读到的就是新的对话。
+ */
+async function runCampusScene(
+  deps: CampusDeps,
+  opts: { kind: 'class' | 'advance'; action?: string; era: string; cast: CharacterProfile[] },
+): Promise<{ count: number }> {
+  const before = loadCampusState() || defaultCampusState(
+    'gryffindor',
+    deps.characters.map(c => ({ charId: c.id, name: c.name, houseId: (c as any).houseId })),
+  );
+  const action = opts.action ?? null;
+  const instruction = buildSceneInstruction(before, opts.kind, action, opts.era, opts.cast);
+
+  const result = await hogwartsGenerate({
+    feature: 'campus', globalApi: deps.apiConfig,
+    char: deps.characters[0], userProfile: deps.userProfile,
+    instructions: instruction,
+    userInput: opts.kind === 'class'
+      ? (action || '（继续课堂）')
+      : `（推进时间线：第 ${before.day} 天 ${before.period} → 下一时段）`,
+    temperature: 0.95,
+    maxTokens: 1200,
+  });
+
+  const msgs: CampusMessage[] = parseSceneMessages(result).map((m, i) => ({
+    ...m, id: `ev-${Date.now()}-${i}`, at: Date.now(),
+  }));
+
+  // 重新读一次最新存档再合并，避免覆盖期间（比如用户又发了一句）写入的内容
+  const latest = loadCampusState() || before;
+  const advance = opts.kind === 'advance'
+    ? (() => {
+        const { day, period } = nextCampusPeriod(latest.day, latest.period);
+        const list = ACTIVITIES[period];
+        const activity = list[Math.floor(Math.random() * list.length)];
+        const location = period === 'evening' && activity === '公共休息室闲聊' ? '公共休息室' : LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
+        return { day, period, activity, location };
+      })()
+    : null;
+  const attrBonus = advance ? Math.floor(Math.random() * 3) + 1 : 0;
+
+  const next: CampusState = {
+    ...latest,
+    ...(advance ? { day: advance.day, period: advance.period, activity: advance.activity, location: advance.location } : {}),
+    attributes: advance
+      ? { ...latest.attributes, knowledge: latest.attributes.knowledge + attrBonus }
+      : latest.attributes,
+    messages: [...(latest.messages || []), ...msgs].slice(-200),
+  };
+  saveCampusState(next);
+
+  if (advance) awardHousePoints(latest.houseId, attrBonus, `按时到课：${advance.activity}`);
+
+  // 简单评价：教授台词里出现加分/扣分关键词时记学院分
+  const profText = msgs.filter(m => m.role === 'professor').map(m => m.text).join(' ');
+  if (/加\d+分|[+\uFF0B]\d+\s*分|十分出色|格兰芬多.*加分/.test(profText)) awardHousePoints(latest.houseId, 5, '课堂表现出色');
+  else if (/扣\d+分|[-\uFF0D]\d+\s*分|格兰芬多.*扣分/.test(profText)) awardHousePoints(latest.houseId, -3, '课堂表现不佳');
+
+  return { count: msgs.length };
+}
 
 const CampusApp: React.FC = () => {
   const { closeApp, characters, apiConfig, userProfile, addToast } = useOS();
@@ -50,8 +180,24 @@ const CampusApp: React.FC = () => {
     return defaultCampusState('gryffindor', characters.map(c => ({ charId: c.id, name: c.name, houseId: (c as any).houseId })));
   });
   const [input, setInput] = useState('');
-  const [busy, setBusy] = useState(false);
   const logsRef = useRef<HTMLDivElement>(null);
+  // 演绎任务跑在模块作用域：切页面、锁屏都不会中断，回来时对话已经在存档里
+  const { running, lastFinished, busy } = useHogwartsTaskKind('campus');
+  // 时间线 + 玩家点名的出场角色（其余 NPC 由 AI 按时代自动生成）
+  const [era, setEra] = useState(() => loadCampusEra());
+  const [castIds, setCastIds] = useState<string[]>(() => loadCampusCast());
+  const [pickingCast, setPickingCast] = useState(false);
+
+  const eraChars = filterCharactersByEra(characters, era);
+  const cast = castIds.length > 0
+    ? eraChars.filter(c => castIds.includes(c.id))
+    : eraChars.slice(0, 3);
+
+  const toggleCast = (id: string) => {
+    const next = castIds.includes(id) ? castIds.filter(x => x !== id) : [...castIds, id];
+    setCastIds(next);
+    saveCampusCast(next);
+  };
 
   const persist = useCallback((next: CampusState) => { saveCampusState(next); setState(next); }, []);
 
@@ -67,85 +213,32 @@ const CampusApp: React.FC = () => {
     logsRef.current?.scrollTo({ top: logsRef.current.scrollHeight, behavior: 'smooth' });
   }, [state.messages?.length, busy]);
 
-  /** 让 AI 推进一段群像剧情：教授 + NPC 同学 + 旁白。 */
-  const generateScene = useCallback(async (userAction: string | null, kind: 'class' | 'advance') => {
-    const prof = professorFor(state.activity);
-    const recent = (state.messages || []).slice(-10).map(m => `${m.speaker}（${m.role}）：${m.text}`).join('\n');
-    const hasUserLine = kind === 'class';
-    const instruction = `你在运营一个「霍格沃茨沉浸式校园群像演绎」，风格参考酒馆角色扮演：真人感、群像、鲜活。
-当前场景：第 ${state.day} 天 ${PERIOD_LABEL[state.period]} · ${state.location} · ${state.activity}
-在场权威人物：${prof.name}（${prof.style}）
-用户学院：${HOUSE_META[state.houseId].cn}
+  // 后台演绎完成（可能是在别的页面完成的）→ 把最新存档读回界面
+  useEffect(() => {
+    const latest = loadCampusState();
+    if (latest) setState(latest);
+  }, [lastFinished?.id]);
 
-### 在场同学池（从中随机挑 2-3 位出场，必须符合各自性格）
-罗恩·韦斯莱（格兰芬多，胆小讲义气爱吐槽）、赫敏·格兰杰（格兰芬多学霸爱纠正人）、德拉科·马尔福（斯莱特林傲慢毒舌）、卢娜·洛夫古德（拉文克劳神神叨叨）、塞德里克·迪戈里（赫奇帕奇阳光正直）、弗雷德·韦斯莱（格兰芬多恶作剧大师）、潘西·帕金森（斯莱特林刻薄爱八卦）、秋·张（拉文克劳温和）、汉娜·艾博（赫奇帕奇热心）、李·乔丹（格兰芬多解说员爱夸张）
-
-### 本轮要求
-${kind === 'advance'
-  ? '用户跳过/推进时段。先用 1-2 条旁白描写时间流逝和场景切换（下一节课或课间），再安排教授开场和 2-3 位同学的鲜活吐槽（传纸条、偷偷抱怨作业多、抢座位之类）——要像真的在学校。'
-  : `用户刚做了一个行动或说了一句话：「${userAction}」。\n1. 用 1 条旁白描写这个动作的即时后果（周围人的目光、声响、细节）。\n2. 教授做出反应（点名、评价、扣分/加分）。\n3. 至少 2 位在场同学用符合性格的口吻吐槽或起哄（可以带（小声）（传纸条）（憋笑）这类动作括注）。\n4. 结尾留一个钩子，让用户想继续。`}
-台词要短而真实，像真人说话，不要书面腔。剧情走向遵循哈利波特世界观。
-
-严格输出 JSON 数组（3-5 条消息），不要输出其他内容：
-\`\`\`json
-[
-  {"role":"narration","speaker":"GM","text":"旁白描写"},
-  {"role":"professor","speaker":"${prof.name}","text":"教授的话"},
-  {"role":"npc","speaker":"罗恩·韦斯莱","houseId":"gryffindor","text":"（小声）…"}
-]
-\`\`\`
-角色 role 只能是 narration / professor / npc。`;
-    const result = await hogwartsGenerate({
-      feature: 'campus', globalApi: apiConfig as any,
-      char: characters[0], userProfile: userProfile as any,
-      instructions: instruction,
-      userInput: hasUserLine ? (userAction || '（继续课堂）') : `（推进时间线：第 ${state.day} 天 ${state.period} → 下一时段）`,
-      temperature: 0.95,
-      maxTokens: 1200,
-    });
-    return parseSceneMessages(result);
-  }, [apiConfig, characters, state.day, state.period, state.activity, state.location, state.houseId, state.messages, userProfile]);
-
-  const advancePeriod = useCallback(() => {
-    const { day, period } = nextCampusPeriod(state.day, state.period);
-    const activityList = ACTIVITIES[period];
-    const activity = activityList[Math.floor(Math.random() * activityList.length)];
-    const location = period === 'evening' && activity === '公共休息室闲聊' ? '公共休息室' : LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
-    return { day, period, activity, location };
-  }, [state.day, state.period]);
-
-  const handleAdvance = async () => {
+  const handleAdvance = () => {
     if (busy) return;
-    setBusy(true);
-    try {
-      const nextPeriod = advancePeriod();
-      const msgs = await generateScene(null, 'advance');
-      const stamped = msgs.map((m, i) => ({ ...m, id: `ev-${Date.now()}-${i}`, at: Date.now() }));
-      const attrBonus = Math.floor(Math.random() * 3) + 1;
-      appendMessages(stamped, { ...nextPeriod, attributes: { ...state.attributes, knowledge: state.attributes.knowledge + attrBonus } });
-      awardHousePoints(state.houseId, attrBonus, `按时到课：${nextPeriod.activity}`);
-    } catch (e: any) {
-      addToast(e?.message || '生成失败，请检查 API 配置', 'error');
-    } finally { setBusy(false); }
+    void runHogwartsTask({
+      kind: 'campus',
+      label: '霍格沃茨校园 · 推进时段',
+      notice: () => '🎬 新的课堂场景已存档',
+      run: () => runCampusScene({ apiConfig, characters, userProfile }, { kind: 'advance', era, cast }),
+    });
   };
 
-  const handleAct = async (actionText?: string) => {
+  const handleAct = (actionText?: string) => {
     const text = (actionText ?? input).trim();
     if (!text || busy) return;
     setInput('');
-    setBusy(true);
     appendMessages([{ id: `u-${Date.now()}`, role: 'user', speaker: userProfile.name || '我', text, at: Date.now() }]);
-    try {
-      const msgs = await generateScene(text, 'class');
-      const stamped = msgs.map((m, i) => ({ ...m, id: `ev-${Date.now()}-${i}`, at: Date.now() }));
-      appendMessages(stamped);
-      // 简单评价：教授台词里出现加分/扣分关键词时记学院分
-      const profText = stamped.filter(m => m.role === 'professor').map(m => m.text).join(' ');
-      if (/加\d+分|[+\uFF0B]\d+\s*分|十分出色|格兰芬多.*加分/.test(profText)) awardHousePoints(state.houseId, 5, '课堂表现出色');
-      else if (/扣\d+分|[-\uFF0D]\d+\s*分|格兰芬多.*扣分/.test(profText)) awardHousePoints(state.houseId, -3, '课堂表现不佳');
-    } catch (e: any) {
-      addToast(e?.message || '生成失败，请检查 API 配置', 'error');
-    } finally { setBusy(false); }
+    void runHogwartsTask({
+      kind: 'campus',
+      label: '霍格沃茨校园 · 演绎',
+      run: () => runCampusScene({ apiConfig, characters, userProfile }, { kind: 'class', action: text, era, cast }),
+    });
   };
 
   const renderBubble = (m: CampusMessage) => {
@@ -184,7 +277,7 @@ ${kind === 'advance'
 
   const attrs = state.attributes;
   const messages = state.messages || [];
-  const prof = professorFor(state.activity);
+  const prof = professorFor(state.activity, era);
 
   return (
     <div className="h-full w-full bg-gradient-to-b from-indigo-950 via-[#1a1a2e] to-slate-900 flex flex-col font-light overflow-hidden text-amber-50">
@@ -200,6 +293,11 @@ ${kind === 'advance'
             <h1 className="text-base font-medium text-amber-100 tracking-wide">🏰 霍格沃茨校园</h1>
             <div className="text-[11px] text-amber-200/60 truncate">Day {state.day} · {PERIOD_LABEL[state.period]} · {state.activity} @ {state.location}</div>
           </div>
+          <select value={era} onChange={e => { setEra(e.target.value); saveCampusEra(e.target.value); }}
+            className="px-2 py-1 rounded-full bg-black/30 border border-amber-300/30 text-amber-100 text-xs focus:outline-none max-w-[7.5rem]"
+            title="选择时间线时代">
+            {FORUM_ERAS.map(e => <option key={e.id} value={e.id} className="bg-slate-800">{e.label}</option>)}
+          </select>
           <select value={state.houseId} onChange={e => persist({ ...state, houseId: e.target.value as HouseId })}
             className="px-2 py-1 rounded-full bg-black/30 border border-amber-300/30 text-amber-100 text-xs focus:outline-none">
             {HOUSE_IDS.map(id => <option key={id} value={id} className="bg-slate-800">{HOUSE_META[id].cn}</option>)}
@@ -213,6 +311,20 @@ ${kind === 'advance'
               <span className="ml-1 text-xs font-bold text-amber-100">{v}</span>
             </div>
           ))}
+        </div>
+        {/* 出场角色（玩家点名，其余 NPC 按时代自动生成） */}
+        <div className="flex items-center gap-1.5 px-4 pb-2 overflow-x-auto no-scrollbar">
+          <span className="text-[10px] text-amber-200/50 shrink-0">出场：</span>
+          {cast.length === 0 && <span className="shrink-0 text-[10px] text-amber-200/40">暂无角色，AI 按时代自动生成同学</span>}
+          {cast.map(c => (
+            <span key={c.id} className="shrink-0 px-2 py-0.5 rounded-full bg-amber-400/15 border border-amber-300/30 text-[10px] text-amber-100">
+              {c.name}
+            </span>
+          ))}
+          <button onClick={() => setPickingCast(true)}
+            className="shrink-0 px-2 py-0.5 rounded-full bg-white/5 border border-amber-200/20 text-[10px] text-amber-200/80">
+            ⚙ 选角色
+          </button>
         </div>
       </div>
 
@@ -259,6 +371,46 @@ ${kind === 'advance'
           ⏭ 下课，进入下一时段
         </button>
       </div>
+
+      {pickingCast && (
+        <div className="absolute inset-0 z-30 flex flex-col justify-end" style={{ background: 'rgba(0,0,0,0.65)' }}
+          onClick={() => setPickingCast(false)}>
+          <div className="rounded-t-2xl border-t border-amber-300/30 p-4 max-h-[72%] overflow-y-auto"
+            style={{ background: '#141a2e' }} onClick={e => e.stopPropagation()}>
+            <div className="flex items-center mb-1.5">
+              <h3 className="text-sm text-amber-100 flex-1">选择出场角色</h3>
+              <button onClick={() => setPickingCast(false)} className="text-xs text-amber-300 px-2 py-1">完成</button>
+            </div>
+            <p className="text-[10px] text-amber-200/50 mb-2.5">
+              只显示符合「{FORUM_ERAS.find(e => e.id === era)?.label || '当前时间线'}」的角色；没点名的同学由 AI 按时代自动生成。
+            </p>
+            {eraChars.length === 0 && (
+              <div className="text-xs text-amber-200/40 py-8 text-center leading-relaxed">
+                这个时间线下没有可用角色。<br />去「猫头鹰邮局」导入该时代的卡，或换个时代。
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-1.5">
+              {eraChars.map(c => {
+                const on = castIds.includes(c.id);
+                return (
+                  <button key={c.id} onClick={() => toggleCast(c.id)}
+                    className={`flex items-center gap-2 rounded-xl px-2.5 py-2 border text-left active:scale-[0.98] transition-transform ${on ? 'border-amber-300/60 bg-amber-400/15' : 'border-white/10 bg-white/5'}`}>
+                    {c.avatar
+                      ? <img src={c.avatar} alt="" className="w-6 h-6 rounded-full object-cover" />
+                      : <span className="w-6 h-6 rounded-full bg-white/10 text-[10px] flex items-center justify-center text-amber-100">{c.name[0]}</span>}
+                    <span className="text-xs text-amber-50 truncate flex-1">{c.name}</span>
+                    {on && <span className="text-amber-300 text-[10px]">✓</span>}
+                  </button>
+                );
+              })}
+            </div>
+            <button onClick={() => { setCastIds([]); saveCampusCast([]); }}
+              className="mt-3 w-full py-2 rounded-xl border border-white/15 text-xs text-amber-200/70">
+              清空，交给 AI 自动挑
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

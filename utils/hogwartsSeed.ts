@@ -24,6 +24,7 @@ const seed = (
   firstMes,
   memories: [],
   houseId,
+  era: 'trio',
   contextLimit: 60,
   contextRangeMode: 'manual' as const,
   contextRangePolicyVersion: 1,

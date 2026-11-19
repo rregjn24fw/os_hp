@@ -1,6 +1,8 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useOS } from '../context/OSContext';
 import { hogwartsGenerate } from '../utils/hogwartsGenerate';
+import { runHogwartsTask, useHogwartsTaskKind, isHogwartsTaskRunning } from '../utils/hogwartsTasks';
+import { eraNpcPool, filterCharactersByEra, ERA_SPOILER_NOTE } from '../utils/hogwartsEras';
 import {
   HOUSE_META, awardHousePoints,
   FORUM_BOARDS, FORUM_NPC_POOL, FORUM_ERAS,
@@ -9,7 +11,7 @@ import {
   loadForumPosts, saveForumPosts, parseForumGeneration,
   loadForumEra, saveForumEra,
 } from '../utils/hogwarts';
-import type { HouseId, SocialPost } from '../types';
+import type { HouseId, SocialPost, CharacterProfile } from '../types';
 
 // 兼容旧数据：老帖子的 board 存的是版块名，统一迁到 id。
 const NAME_TO_BOARD_ID = new Map(FORUM_BOARDS.filter(b => b.id !== 'all').map(b => [b.name, b.id]));
@@ -33,29 +35,21 @@ interface DraftPost {
   houseId?: HouseId;
 }
 
-const ForumApp: React.FC = () => {
-  const { closeApp, characters, apiConfig, userProfile, addToast } = useOS();
-  const [posts, setPosts] = useState<SocialPost[]>(() => loadPosts());
-  const [board, setBoard] = useState('all');
-  const [composing, setComposing] = useState(false);
-  const [title, setTitle] = useState('');
-  const [content, setContent] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [openPost, setOpenPost] = useState<SocialPost | null>(null);
-  const [era, setEra] = useState(() => loadForumEra());
-  const autoStarted = useRef(false);
+/** 生成所需依赖：在任务启动那一刻捕获，之后与组件生命周期无关。 */
+interface ForumDeps {
+  apiConfig: any;
+  characters: CharacterProfile[];
+  userProfile: any;
+  era: string;
+}
 
-  const persist = (p: SocialPost[]) => { savePosts(p); setPosts(p); };
-
-  const filtered = board === 'all' ? posts : posts.filter(p => p.board === board);
-
-  // ── 发帖核心：角色 / NPC / 用户共用 ─────────────────────────────
-  const buildPost = useCallback((opts: {
-    authorName: string; authorAvatar?: string;
-    title: string; content: string;
-    boardId: string; authorType: SocialPost['authorType'];
-    authorCharId?: string; houseId?: HouseId; likes?: number;
-  }, now = Date.now()): SocialPost => ({
+function makePost(opts: {
+  authorName: string; authorAvatar?: string;
+  title: string; content: string;
+  boardId: string; authorType: SocialPost['authorType'];
+  authorCharId?: string; houseId?: HouseId; likes?: number;
+}, now = Date.now()): SocialPost {
+  return {
     id: `post-${now}-${Math.random().toString(36).slice(2, 6)}`,
     authorName: opts.authorName,
     authorAvatar: opts.authorAvatar || '',
@@ -66,93 +60,141 @@ const ForumApp: React.FC = () => {
     ...(opts.authorCharId ? { authorCharId: opts.authorCharId } : {}),
     board: opts.boardId,
     houseId: opts.houseId,
-  }), []);
+  };
+}
 
-  const generateOne = useCallback(async (opts: {
-    name: string; avatar?: string; houseId?: HouseId;
-    charId?: string; persona?: string; authorType: SocialPost['authorType'];
-    postsSnapshot: SocialPost[];
-  }): Promise<DraftPost> => {
-    const ctx = forumTimeContext();
-    const eraLabel = FORUM_ERAS.find(e => e.id === era)?.label;
-    const houseHint = opts.houseId ? `，并体现${HOUSE_META[opts.houseId].cn}学院特色` : '';
-    const personaHint = opts.persona ? `（性格：${opts.persona}）` : '';
-    const charHint = `你是霍格沃茨${opts.houseId ? HOUSE_META[opts.houseId].cn : ''}的学生 ${opts.name}${personaHint}${houseHint}。`;
-    const instruction = `你在霍格沃茨校内论坛「猫头鹰邮报」发一条帖子，以第一人称、符合身份和性格的口吻写。\n${forumEraInstruction(ctx, charHint, era)}\n严格输出 JSON：{"title":"帖子标题","content":"正文，80-200字"}`;
-    const result = await hogwartsGenerate({
-      feature: 'forum', globalApi: apiConfig as any,
-      ...(opts.charId ? { char: characters.find(c => c.id === opts.charId) } : {}),
-      userProfile: userProfile as any,
-      instructions: instruction,
-      userInput: `以 ${opts.name} 的身份${eraLabel ? `在「${eraLabel}」背景下` : `发一条${ctx.periodLabel}的`}帖子`,
-      maxTokens: 700,
-    });
-    const parsed = parseForumGeneration(result);
-    const boardMeta = FORUM_BOARDS.find(b => b.id === (opts.houseId ? opts.houseId : ['great-hall', 'library', 'great-hall'][Math.floor(Math.random() * 3)])) || FORUM_BOARDS[1];
-    const post = buildPost({
-      authorName: opts.name,
-      authorAvatar: opts.avatar,
-      title: parsed.title,
-      content: parsed.content,
-      boardId: boardMeta.id,
-      authorType: opts.authorType,
-      ...(opts.charId ? { authorCharId: opts.charId } : {}),
-      houseId: opts.houseId,
-      likes: Math.floor(Math.random() * 25),
-    });
-    return { post, houseId: opts.houseId };
-  }, [apiConfig, characters, userProfile, buildPost, era]);
+async function generateOnePost(deps: ForumDeps, opts: {
+  name: string; avatar?: string; houseId?: HouseId;
+  charId?: string; persona?: string; authorType: SocialPost['authorType'];
+}): Promise<DraftPost> {
+  const ctx = forumTimeContext();
+  const eraLabel = FORUM_ERAS.find(e => e.id === deps.era)?.label;
+  const houseHint = opts.houseId ? `，并体现${HOUSE_META[opts.houseId].cn}学院特色` : '';
+  const personaHint = opts.persona ? `（性格：${opts.persona}）` : '';
+  const charHint = `你是霍格沃茨${opts.houseId ? HOUSE_META[opts.houseId].cn : ''}的学生 ${opts.name}${personaHint}${houseHint}。`;
+  const spoiler = deps.era === 'auto' ? '' : `\n${ERA_SPOILER_NOTE[deps.era as keyof typeof ERA_SPOILER_NOTE] || ''}`;
+  const instruction = `你在霍格沃茨校内论坛「猫头鹰邮报」发一条帖子，以第一人称、符合身份和性格的口吻写。\n${forumEraInstruction(ctx, charHint, deps.era)}${spoiler}\n严格输出 JSON：{"title":"帖子标题","content":"正文，80-200字"}`;
+  const result = await hogwartsGenerate({
+    feature: 'forum', globalApi: deps.apiConfig,
+    ...(opts.charId ? { char: deps.characters.find(c => c.id === opts.charId) } : {}),
+    userProfile: deps.userProfile,
+    instructions: instruction,
+    userInput: `以 ${opts.name} 的身份${eraLabel ? `在「${eraLabel}」背景下` : `发一条${ctx.periodLabel}的`}帖子`,
+    maxTokens: 700,
+  });
+  const parsed = parseForumGeneration(result);
+  const boardMeta = FORUM_BOARDS.find(b => b.id === (opts.houseId ? opts.houseId : ['great-hall', 'library', 'great-hall'][Math.floor(Math.random() * 3)])) || FORUM_BOARDS[1];
+  const post = makePost({
+    authorName: opts.name,
+    authorAvatar: opts.avatar,
+    title: parsed.title,
+    content: parsed.content,
+    boardId: boardMeta.id,
+    authorType: opts.authorType,
+    ...(opts.charId ? { authorCharId: opts.charId } : {}),
+    houseId: opts.houseId,
+    likes: Math.floor(Math.random() * 25),
+  });
+  return { post, houseId: opts.houseId };
+}
+
+/**
+ * 一次性生成一批帖子并落库。
+ * 注意：整个函数跑在模块作用域（不是组件里），所以切走页面也不会被打断；
+ * 完成时直接写 localStorage，回到论坛读到的就是新的。
+ */
+async function generateForumBatch(
+  deps: ForumDeps,
+  batchSize: number,
+  report?: (detail: string) => void,
+): Promise<{ added: number }> {
+  // 时代隔离：NPC 池换成当前时代的人，角色也只用符合时代的
+  const shuffledNpc = [...eraNpcPool(deps.era)].sort(() => Math.random() - 0.5);
+  const charShuffled = [...filterCharactersByEra(deps.characters, deps.era)].sort(() => Math.random() - 0.5);
+  const jobs: Array<Parameters<typeof generateOnePost>[1]> = charShuffled
+    .slice(0, Math.min(2, charShuffled.length))
+    .map(c => ({
+      name: c.name, avatar: (c as any).avatar, houseId: (c as any).houseId,
+      charId: c.id, authorType: 'character' as const,
+    }));
+  for (const npc of shuffledNpc.slice(0, Math.max(0, batchSize - jobs.length))) {
+    jobs.push({ name: npc.name, houseId: npc.houseId, persona: npc.persona, authorType: 'stranger' as const });
+  }
+
+  let done = 0;
+  report?.(`放出了 ${jobs.length} 只猫头鹰…`);
+  const results = await Promise.allSettled(
+    jobs.map(j => generateOnePost(deps, j).then(r => {
+      done += 1;
+      report?.(`猫头鹰已送达 ${done}/${jobs.length}`);
+      return r;
+    })),
+  );
+
+  const fresh: SocialPost[] = [];
+  const earned: Array<[HouseId, string]> = [];
+  for (const r of results) {
+    if (r.status === 'fulfilled') {
+      fresh.push(r.value.post);
+      if (r.value.houseId) earned.push([r.value.houseId, r.value.post.authorName]);
+    }
+  }
+  if (fresh.length === 0) throw new Error('这一批都没生成成功，稍后再试');
+
+  // 以「此刻最新存档」为基准合并，避免覆盖期间别处（比如手动发帖）写入的数据
+  const base = loadPosts();
+  savePosts([...fresh, ...base]);
+  for (const [hid, name] of earned) awardHousePoints(hid, 2, `${name} 在论坛活跃发言`);
+  return { added: fresh.length };
+}
+
+const ForumApp: React.FC = () => {
+  const { closeApp, characters, apiConfig, userProfile, addToast } = useOS();
+  const [posts, setPosts] = useState<SocialPost[]>(() => loadPosts());
+  const [board, setBoard] = useState('all');
+  const [composing, setComposing] = useState(false);
+  const [title, setTitle] = useState('');
+  const [content, setContent] = useState('');
+  const [openPost, setOpenPost] = useState<SocialPost | null>(null);
+  const [era, setEra] = useState(() => loadForumEra());
+  const autoStarted = useRef(false);
+  // 发帖任务跑在模块作用域：切走页面再回来，状态与结果都还在
+  const { running, lastFinished, busy } = useHogwartsTaskKind('forum');
+
+  const persist = (p: SocialPost[]) => { savePosts(p); setPosts(p); };
+
+  const filtered = board === 'all' ? posts : posts.filter(p => p.board === board);
+
+  // 后台任务完成（或在别的页面完成）后，重新从存档拉一遍
+  useEffect(() => {
+    setPosts(loadPosts());
+  }, [lastFinished?.id]);
 
   // ── 进入论坛自动补帖：按当前时代生成 NPC + 角色发帖 ───────────────
+  // 不在组件里 await：交给后台任务层跑，用户切走页面也照常完成并落库。
   useEffect(() => {
     if (autoStarted.current) return;
     autoStarted.current = true;
-    const current = loadPosts();
-    if (!shouldAutoGenerateForumPosts(current.length)) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        markForumAutoGenerated();
-        // 一次生成 5-6 条：用户角色最多 2 条 + NPC 补足；没角色则全 NPC。
-        const batch = 5 + Math.floor(Math.random() * 2);
-        const charPool = characters.slice();
-        const shuffledNpc = [...FORUM_NPC_POOL].sort(() => Math.random() - 0.5);
-        const tasks: Array<Parameters<typeof generateOne>[0]> = [];
-        for (const c of [...charPool].sort(() => Math.random() - 0.5).slice(0, Math.min(2, charPool.length))) {
-          tasks.push({
-            name: c.name, avatar: (c as any).avatar, houseId: (c as any).houseId,
-            charId: c.id, authorType: 'character', postsSnapshot: current,
-          });
-        }
-        for (const npc of shuffledNpc.slice(0, batch - tasks.length)) {
-          tasks.push({ name: npc.name, houseId: npc.houseId, persona: npc.persona, authorType: 'stranger', postsSnapshot: current });
-        }
-        const results = await Promise.allSettled(tasks.map(t => generateOne(t)));
-        if (cancelled) return;
-        const fresh: SocialPost[] = [];
-        let earned: Array<[HouseId, string]> = [];
-        for (const r of results) {
-          if (r.status === 'fulfilled') {
-            fresh.push(r.value.post);
-            if (r.value.houseId) earned.push([r.value.houseId, r.value.post.authorName]);
-          }
-        }
-        if (fresh.length > 0) {
-          const base = loadPosts().map(p => ({ ...p, board: normalizeBoardId(p) })) as SocialPost[];
-          persist([...fresh, ...base]);
-          for (const [hid, name] of earned) awardHousePoints(hid, 2, `${name} 在论坛活跃发言`);
-          addToast(`🦉 ${fresh.length} 位霍格沃茨学生刚刚发了新帖`, 'success');
-        }
-      } catch { /* 静默失败：论坛仍是空态可手动生成 */ }
-    })();
-    return () => { cancelled = true; };
+    if (isHogwartsTaskRunning('forum')) return;
+    if (!shouldAutoGenerateForumPosts(loadPosts().length)) return;
+    markForumAutoGenerated();
+    void runHogwartsTask({
+      kind: 'forum',
+      label: '猫头鹰论坛 · 自动补帖',
+      notice: (r: { added: number }) => `🦉 ${r.added} 位霍格沃茨学生发了新帖`,
+      run: ctx => generateForumBatch(
+        { apiConfig, characters, userProfile, era },
+        5 + Math.floor(Math.random() * 2),
+        ctx.report,
+      ),
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handlePublish = () => {
     if (!title.trim() || !content.trim()) { addToast('请填写标题和内容', 'error'); return; }
     const boardMeta = FORUM_BOARDS.find(b => b.id === board);
-    const post = buildPost({
+    const post = makePost({
       authorName: userProfile.name || '我',
       authorAvatar: (userProfile as any).avatar || '',
       title: title.trim(), content: content.trim(),
@@ -165,38 +207,19 @@ const ForumApp: React.FC = () => {
     addToast('发帖成功', 'success');
   };
 
-  const handleGenerate = async () => {
+  const handleGenerate = () => {
     if (busy) return;
-    setBusy(true);
-    try {
-      // 一次生成 5-6 篇：优先角色（最多 2 条），其余由 NPC 补足。
-      const batch = 5 + Math.floor(Math.random() * 2);
-      const shuffledNpc = [...FORUM_NPC_POOL].sort(() => Math.random() - 0.5);
-      const charShuffled = [...characters].sort(() => Math.random() - 0.5);
-      const tasks: Array<Parameters<typeof generateOne>[0]> = charShuffled.slice(0, Math.min(2, charShuffled.length))
-        .map(c => ({
-          name: c.name, avatar: (c as any).avatar, houseId: (c as any).houseId,
-          charId: c.id, authorType: 'character' as const, postsSnapshot: posts,
-        }));
-      for (const npc of shuffledNpc.slice(0, batch - tasks.length)) {
-        tasks.push({ name: npc.name, houseId: npc.houseId, persona: npc.persona, authorType: 'stranger' as const, postsSnapshot: posts });
-      }
-      const results = await Promise.allSettled(tasks.map(t => generateOne(t)));
-      const fresh: SocialPost[] = [];
-      const earned: Array<[HouseId, string]> = [];
-      for (const r of results) {
-        if (r.status === 'fulfilled') {
-          fresh.push(r.value.post);
-          if (r.value.houseId) earned.push([r.value.houseId, r.value.post.authorName]);
-        }
-      }
-      if (fresh.length === 0) throw new Error('这一批都没生成成功，稍后再试');
-      persist([...fresh, ...posts]);
-      for (const [hid, name] of earned) awardHousePoints(hid, 2, `${name} 在论坛活跃发言`);
-      addToast(`🦉 ${fresh.length} 位霍格沃茨学生刚刚发了新帖`, 'success');
-    } catch (e: any) {
-      addToast(e?.message || '生成失败', 'error');
-    } finally { setBusy(false); }
+    // 生成跑在后台任务层：中途切页面不会中断，回来时帖子已经在列表里
+    void runHogwartsTask({
+      kind: 'forum',
+      label: '猫头鹰论坛 · 生成一批帖子',
+      notice: (r: { added: number }) => `🦉 ${r.added} 位霍格沃茨学生刚刚发了新帖`,
+      run: ctx => generateForumBatch(
+        { apiConfig, characters, userProfile, era },
+        5 + Math.floor(Math.random() * 2),
+        ctx.report,
+      ),
+    });
   };
 
   const handleLike = (id: string) => {
@@ -242,6 +265,13 @@ const ForumApp: React.FC = () => {
             </button>
           ))}
         </div>
+        {busy && (
+          <div className="px-4 pb-2 -mt-1 flex items-center gap-1.5 text-[10px] text-amber-200/60">
+            <span className="w-1.5 h-1.5 rounded-full bg-amber-300 animate-pulse" />
+            {running?.detail || '猫头鹰在路上…'}
+            <span className="text-amber-200/35">（可切走，回来就在）</span>
+          </div>
+        )}
       </div>
 
       <div className="flex-1 overflow-y-auto px-4 py-4 pb-24">

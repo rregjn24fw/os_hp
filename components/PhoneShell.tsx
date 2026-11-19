@@ -11,6 +11,7 @@ import { shouldShowAnniversaryGift, markAnniversaryGiftSeen } from '../utils/ann
 
 
 import React, { useState, useEffect, useMemo, useRef, Suspense } from 'react';
+import { subscribeHogwartsTask, takeHogwartsNotice } from '../utils/hogwartsTasks';
 import { IMPORT_IN_PROGRESS_KEY, useOS } from '../context/OSContext';
 import StatusBar from './os/StatusBar';
 import { SARModuleMonitor } from './sar/SARModuleMonitor';
@@ -512,7 +513,7 @@ const AppEnterStage: React.FC<{
 };
 
 const PhoneShell: React.FC = () => {
-  const { theme, isLocked, unlock, activeApp, closeApp, openApp, virtualTime, isDataLoaded, toasts, unreadMessages, characters, groups, handleBack, suspendedCall, resumeCall, suspendedDate, resumeDate, activeCharacterId, errorDialog, dismissError, sysOperation } = useOS();
+  const { theme, isLocked, unlock, activeApp, closeApp, openApp, virtualTime, isDataLoaded, toasts, unreadMessages, characters, groups, handleBack, suspendedCall, resumeCall, suspendedDate, resumeDate, activeCharacterId, errorDialog, dismissError, sysOperation, addToast } = useOS();
   const useIOSStandaloneLayout = isIOSStandaloneWebApp();
   const reducedBlur = useReducedBlur();
   const deploymentNotice = useDeploymentNotice();
@@ -523,6 +524,16 @@ const PhoneShell: React.FC = () => {
       setSettledApp(AppID.Launcher);
     }
   }, [activeApp]);
+
+  // 霍格沃茨后台任务（论坛/校园/番外）完成时，无论用户当前在哪个 App 都弹一条提示。
+  // 请求本身跑在模块作用域，组件卸载也不影响，所以提示由外壳统一消费。
+  useEffect(() => subscribeHogwartsTask(() => {
+    let notice = takeHogwartsNotice();
+    while (notice) {
+      addToast(notice.text, notice.type);
+      notice = takeHogwartsNotice();
+    }
+  }), [addToast]);
 
   // 三档顶部状态栏：安全显示 / 紧凑显示 / 隐藏。旧存档仍由 hideStatusBar 兼容解析。
   // compact 把时间放进 safe-area，本体顶栏只让出 max(safe-area, 1.5rem)，避免顶部再多一整行。

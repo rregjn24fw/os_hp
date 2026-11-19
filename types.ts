@@ -3079,6 +3079,12 @@ export interface CharacterProfile {
   worldview?: string;
   /** 霍格沃茨学院归属（自用二改）。 */
   houseId?: HouseId;
+  /**
+   * 角色所属时间线（自用二改）：marauders / trio / postwar / nextgen。
+   * 留空表示「不限时代」（如邓布利多、麦格这类跨时代存在的角色）。
+   * 论坛与校园按此做时代隔离，避免亲时代里冒出哈利·波特。
+   */
+  era?: string;
   /** 酒馆角色卡：开场白与备选开场（自用二改，导入 SillyTavern 卡时填充）。 */
   firstMes?: string;
   alternateGreetings?: string[];

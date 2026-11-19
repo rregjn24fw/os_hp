@@ -5,9 +5,10 @@
  *  - 禁林悬案（≈剧本杀）：AI 生成案件/嫌疑人/线索，自由提问后指认揭晓。
  * 状态存 localStorage（hogwarts_rec_*），AI 复用 hogwartsGenerate（campus 配置）。
  */
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useOS } from '../context/OSContext';
 import { hogwartsGenerate } from '../utils/hogwartsGenerate';
+import { runHogwartsTask, useHogwartsTaskKind } from '../utils/hogwartsTasks';
 import { HOUSE_META, awardHousePoints, houseOfCharacter } from '../utils/hogwarts';
 import type { HouseId } from '../types';
 
@@ -46,11 +47,107 @@ const saveMystery = (m: MysteryState | null) => { if (m) write(KEY_MYSTERY, m); 
 const MAX_DUEL_HP = 100;
 const MAX_ASKS = 5;
 
+
+// ---------------------------------------------------------------------------
+// 后台任务（跑在模块作用域：切页面不中断，结果直接落 localStorage）
+// ---------------------------------------------------------------------------
+
+interface RecDeps { characters: any[]; apiConfig: any; userProfile: any }
+
+/** 打一轮决斗：读存档 → 生成 → 结算 → 写回。 */
+async function runDuelRound(deps: RecDeps, move: string): Promise<DuelState> {
+  const duel = read<DuelState | null>(KEY_DUEL, null as any);
+  if (!duel || duel.finished) throw new Error('这局已经结束了');
+  const opponent = deps.characters.find(c => c.id === duel.opponentId);
+  const result = await hogwartsGenerate({
+    feature: 'campus', globalApi: deps.apiConfig,
+    char: opponent, userProfile: deps.userProfile,
+    instructions: `你在模拟霍格沃茨决斗俱乐部的一场对决。对手（用户）本轮出招："${move}"。你扮演对手 ${duel.opponentName}。
+严格输出 JSON：{"oppMove":"对手这轮的咒语或动作","oppPower":0-30 的数字,"playerPower":0-30 的数字,"narration":"一两句生动描写本轮交锋的结果"}
+规则：oppPower 表示对手这轮的威力，playerPower 表示用户招式的实际威力（可以受对手防御影响而减弱）。双方 HP 各 100。`,
+    userInput: `当前比分——我 HP:${duel.playerHp} / 对手 HP:${duel.oppHp}，第 ${duel.round} 轮。我出招：${move}`,
+    maxTokens: 500, temperature: 0.9,
+  });
+  const m = result.match(/\{[\s\S]*\}/);
+  const parsed = m ? JSON.parse(m[0]) : { oppMove: '防御', oppPower: 10, playerPower: 10, narration: result };
+  const oppP = Math.max(0, Math.min(30, Number(parsed.oppPower) || 10));
+  const meP = Math.max(0, Math.min(30, Number(parsed.playerPower) || 10));
+  const next: DuelState = {
+    ...duel,
+    playerHp: Math.max(0, duel.playerHp - oppP),
+    oppHp: Math.max(0, duel.oppHp - meP),
+    round: duel.round + 1,
+    log: [
+      ...duel.log,
+      { who: 'me', text: `你使出「${move}」（威力 ${meP}）` },
+      { who: 'opp', text: `${duel.opponentName}：「${String(parsed.oppMove).slice(0, 30)}」（威力 ${oppP}）` },
+      { who: 'sys', text: String(parsed.narration || '').slice(0, 160) },
+    ],
+  };
+  if (next.oppHp <= 0 && next.playerHp <= 0) { next.finished = 'me'; next.log.push({ who: 'sys', text: '双方同时倒下——平局！' }); }
+  else if (next.oppHp <= 0) {
+    next.finished = 'me';
+    const houseId = houseOfCharacter(next.opponentId);
+    if (houseId) awardHousePoints(houseId, -5, '决斗失利');
+    next.log.push({ who: 'sys', text: `🏆 ${next.opponentName} 被击飞出局，你赢了！（对方学院 -5 分）` });
+    const myHouse = (deps.userProfile as any).houseId;
+    if (myHouse) awardHousePoints(myHouse, 10, '决斗俱乐部获胜');
+  } else if (next.playerHp <= 0) {
+    next.finished = 'opp';
+    const houseId = houseOfCharacter(next.opponentId);
+    if (houseId) awardHousePoints(houseId, 10, '决斗俱乐部获胜');
+    next.log.push({ who: 'sys', text: `💫 你被缴械倒地。${next.opponentName} 获胜（对方学院 +10 分）` });
+  }
+  write(KEY_DUEL, next);
+  return next;
+}
+
+/** 生成一桩新悬案并落库。 */
+async function runMysteryGenerate(deps: RecDeps): Promise<MysteryState> {
+  const npcNames = deps.characters.slice(0, 3).map(c => c.name).filter(Boolean);
+  const result = await hogwartsGenerate({
+    feature: 'campus', globalApi: deps.apiConfig, userProfile: deps.userProfile,
+    instructions: `你在设计一个哈利波特世界的短篇悬案（场景在禁林/城堡）。${npcNames.length ? `嫌疑人可以直接采用这些角色名：${npcNames.join('、')}，或新造 NPC。` : '自行设计 3 个嫌疑人。'}
+严格输出 JSON：{"title":"案件名","scene":"案发场景描述，100字内","suspects":["嫌疑人A","嫌疑人B","嫌疑人C"],"clues":["线索1","线索2","线索3","线索4"],"truth":"完整真相，200字内，指明凶手与动机"}
+线索要公平：真相能从线索中推理出来。`,
+    userInput: '生成一个适合一次游玩的悬案', maxTokens: 900, temperature: 0.95,
+  });
+  const m = result.match(/\{[\s\S]*\}/);
+  if (!m) throw new Error('案件生成失败，稍后再试');
+  const parsed = JSON.parse(m[0]);
+  const next: MysteryState = {
+    title: String(parsed.title || '禁林悬案'),
+    scene: String(parsed.scene || ''),
+    suspects: (parsed.suspects || []).slice(0, 4).map(String),
+    clues: (parsed.clues || []).slice(0, 6).map(String),
+    truth: String(parsed.truth || ''),
+    asked: 0, solved: '', qa: [],
+  };
+  saveMystery(next);
+  return next;
+}
+
+/** 向主持人提一个问题（次数上限由调用方把关）。 */
+async function runMysteryAsk(deps: RecDeps, question: string): Promise<MysteryState> {
+  const mystery = loadMystery();
+  if (!mystery) throw new Error('还没有正在调查的案件');
+  const answer = await hogwartsGenerate({
+    feature: 'campus', globalApi: deps.apiConfig, userProfile: deps.userProfile,
+    instructions: `你在主持一场哈利波特世界的推理问答。案件真相（只有你知道，不能直接透露）：${mystery.truth}
+玩家提问：「${question}」。请以主持人身份回答：可以确认/否认线索相关的事实、描述嫌疑人反应，但不要直接说出凶手是谁或复述真相。不超过 80 字。`,
+    userInput: question, maxTokens: 300, temperature: 0.8,
+  });
+  const next: MysteryState = { ...mystery, asked: mystery.asked + 1, qa: [...mystery.qa, { q: question, a: answer.slice(0, 200) }] };
+  saveMystery(next);
+  return next;
+}
+
 // ---------------------------------------------------------------------------
 // 组件
 // ---------------------------------------------------------------------------
 
 type Tab = 'duel' | 'capsule' | 'mystery';
+type ToastFn = (message: string, type?: 'error' | 'info' | 'success') => void;
 
 const RecreationApp: React.FC = () => {
   const { closeApp, characters, apiConfig, userProfile, addToast } = useOS();
@@ -86,10 +183,15 @@ const RecreationApp: React.FC = () => {
 // 决斗俱乐部
 // ---------------------------------------------------------------------------
 
-const DuelTab: React.FC<{ characters: any[]; apiConfig: any; userProfile: any; addToast: (m: string, t?: string) => void }> = ({ characters, apiConfig, userProfile, addToast }) => {
+const DuelTab: React.FC<{ characters: any[]; apiConfig: any; userProfile: any; addToast: ToastFn }> = ({ characters, apiConfig, userProfile, addToast }) => {
   const [duel, setDuel] = useState<DuelState | null>(() => read<DuelState | null>(KEY_DUEL, null as any));
   const [spell, setSpell] = useState('');
-  const [busy, setBusy] = useState(false);
+  const { lastFinished, busy } = useHogwartsTaskKind('recreation');
+
+  // 后台出招结束（哪怕刚才切走了）→ 读回这一局的存档
+  useEffect(() => {
+    setDuel(read<DuelState | null>(KEY_DUEL, null as any));
+  }, [lastFinished?.id]);
 
   const start = (char: any) => {
     const next: DuelState = {
@@ -101,56 +203,16 @@ const DuelTab: React.FC<{ characters: any[]; apiConfig: any; userProfile: any; a
     write(KEY_DUEL, next); setDuel(next);
   };
 
-  const cast = async () => {
+  const cast = () => {
     if (!duel || busy || duel.finished) return;
     const move = spell.trim() || '除你武器';
-    setBusy(true); setSpell('');
-    try {
-      const opponent = characters.find(c => c.id === duel.opponentId);
-      const result = await hogwartsGenerate({
-        feature: 'campus', globalApi: apiConfig,
-        char: opponent, userProfile,
-        instructions: `你在模拟霍格沃茨决斗俱乐部的一场对决。对手（用户）本轮出招："${move}"。你扮演对手 ${duel.opponentName}。
-严格输出 JSON：{"oppMove":"对手这轮的咒语或动作","oppPower":0-30 的数字,"playerPower":0-30 的数字,"narration":"一两句生动描写本轮交锋的结果"}
-规则：oppPower 表示对手这轮的威力，playerPower 表示用户招式的实际威力（可以受对手防御影响而减弱）。双方 HP 各 100。`,
-        userInput: `当前比分——我 HP:${duel.playerHp} / 对手 HP:${duel.oppHp}，第 ${duel.round} 轮。我出招：${move}`,
-        maxTokens: 500, temperature: 0.9,
-      });
-      const m = result.match(/\{[\s\S]*\}/);
-      const parsed = m ? JSON.parse(m[0]) : { oppMove: '防御', oppPower: 10, playerPower: 10, narration: result };
-      const oppP = Math.max(0, Math.min(30, Number(parsed.oppPower) || 10));
-      const meP = Math.max(0, Math.min(30, Number(parsed.playerPower) || 10));
-      const next: DuelState = {
-        ...duel,
-        playerHp: Math.max(0, duel.playerHp - oppP),
-        oppHp: Math.max(0, duel.oppHp - meP),
-        round: duel.round + 1,
-        log: [
-          ...duel.log,
-          { who: 'me', text: `你使出「${move}」（威力 ${meP}）` },
-          { who: 'opp', text: `${duel.opponentName}：「${String(parsed.oppMove).slice(0, 30)}」（威力 ${oppP}）` },
-          { who: 'sys', text: String(parsed.narration || '').slice(0, 160) },
-        ],
-      };
-      if (next.oppHp <= 0 && next.playerHp <= 0) { next.finished = 'me'; next.log.push({ who: 'sys', text: '双方同时倒下——平局！' }); }
-      else if (next.oppHp <= 0) {
-        next.finished = 'me';
-        const houseId = houseOfCharacter(next.opponentId);
-        if (houseId) awardHousePoints(houseId, -5, '决斗失利');
-        next.log.push({ who: 'sys', text: `🏆 ${next.opponentName} 被击飞出局，你赢了！（对方学院 -5 分）` });
-        const myHouse = (userProfile as any).houseId;
-        if (myHouse) awardHousePoints(myHouse, 10, '决斗俱乐部获胜');
-      }
-      else if (next.playerHp <= 0) {
-        next.finished = 'opp';
-        const houseId = houseOfCharacter(next.opponentId);
-        if (houseId) awardHousePoints(houseId, 10, '决斗俱乐部获胜');
-        next.log.push({ who: 'sys', text: `💫 你被缴械倒地。${next.opponentName} 获胜（对方学院 +10 分）` });
-      }
-      write(KEY_DUEL, next); setDuel(next);
-    } catch (e: any) {
-      addToast(e?.message || '决斗生成失败', 'error');
-    } finally { setBusy(false); }
+    setSpell('');
+    // 请求走后台任务层：出招后切页面也不会断，回来结果就在
+    void runHogwartsTask({
+      kind: 'recreation',
+      label: '决斗俱乐部 · 出招',
+      run: () => runDuelRound({ characters, apiConfig, userProfile }, move),
+    });
   };
 
   if (!duel) {
@@ -207,7 +269,7 @@ const HpBar: React.FC<{ label: string; hp: number; max: number; color: string }>
 // 时间胶囊
 // ---------------------------------------------------------------------------
 
-const CapsuleTab: React.FC<{ addToast: (m: string, t?: string) => void }> = ({ addToast }) => {
+const CapsuleTab: React.FC<{ addToast: ToastFn }> = ({ addToast }) => {
   const [capsules, setCapsules] = useState<Capsule[]>(() => loadCapsules());
   const [composing, setComposing] = useState(false);
   const [title, setTitle] = useState('');
@@ -280,59 +342,39 @@ const CapsuleTab: React.FC<{ addToast: (m: string, t?: string) => void }> = ({ a
 // 禁林悬案
 // ---------------------------------------------------------------------------
 
-const MysteryTab: React.FC<{ characters: any[]; apiConfig: any; userProfile: any; addToast: (m: string, t?: string) => void }> = ({ characters, apiConfig, userProfile, addToast }) => {
+const MysteryTab: React.FC<{ characters: any[]; apiConfig: any; userProfile: any; addToast: ToastFn }> = ({ characters, apiConfig, userProfile, addToast }) => {
   const [mystery, setMystery] = useState<MysteryState | null>(() => loadMystery());
   const [question, setQuestion] = useState('');
-  const [busy, setBusy] = useState(false);
   const [guess, setGuess] = useState('');
+  const { lastFinished, busy } = useHogwartsTaskKind('recreation');
 
-  const generate = async () => {
-    setBusy(true);
-    try {
-      const npcNames = characters.slice(0, 3).map(c => c.name).filter(Boolean);
-      const result = await hogwartsGenerate({
-        feature: 'campus', globalApi: apiConfig, userProfile,
-        instructions: `你在设计一个哈利波特世界的短篇悬案（场景在禁林/城堡）。${npcNames.length ? `嫌疑人可以直接采用这些角色名：${npcNames.join('、')}，或新造 NPC。` : '自行设计 3 个嫌疑人。'}
-严格输出 JSON：{"title":"案件名","scene":"案发场景描述，100字内","suspects":["嫌疑人A","嫌疑人B","嫌疑人C"],"clues":["线索1","线索2","线索3","线索4"],"truth":"完整真相，200字内，指明凶手与动机"}
-线索要公平：真相能从线索中推理出来。`,
-        userInput: '生成一个适合一次游玩的悬案', maxTokens: 900, temperature: 0.95,
-      });
-      const m = result.match(/\{[\s\S]*\}/);
-      const parsed = JSON.parse(m![0]);
-      const next: MysteryState = {
-        title: String(parsed.title || '禁林悬案'),
-        scene: String(parsed.scene || ''),
-        suspects: (parsed.suspects || []).slice(0, 4).map(String),
-        clues: (parsed.clues || []).slice(0, 6).map(String),
-        truth: String(parsed.truth || ''),
-        asked: 0, solved: '', qa: [],
-      };
-      saveMystery(next); setMystery(next);
-    } catch (e: any) {
-      addToast(e?.message || '案件生成失败', 'error');
-    } finally { setBusy(false); }
+  useEffect(() => {
+    setMystery(loadMystery());
+  }, [lastFinished?.id]);
+
+  const generate = () => {
+    void runHogwartsTask({
+      kind: 'recreation',
+      label: '禁林悬案 · 布置案发现场',
+      notice: r => `悬案《${r.title}》已备好，可以开始调查`,
+      run: () => runMysteryGenerate({ characters, apiConfig, userProfile }),
+    });
   };
 
-  const ask = async () => {
+  const ask = () => {
     if (!mystery || busy || !question.trim() || mystery.asked >= MAX_ASKS) return;
-    const q = question.trim(); setBusy(true); setQuestion('');
-    try {
-      const answer = await hogwartsGenerate({
-        feature: 'campus', globalApi: apiConfig, userProfile,
-        instructions: `你在主持一场哈利波特世界的推理问答。案件真相（只有你知道，不能直接透露）：${mystery.truth}
-玩家提问：「${q}」。请以主持人身份回答：可以确认/否认线索相关的事实、描述嫌疑人反应，但不要直接说出凶手是谁或复述真相。不超过 80 字。`,
-        userInput: q, maxTokens: 300, temperature: 0.8,
-      });
-      const next: MysteryState = { ...mystery, asked: mystery.asked + 1, qa: [...mystery.qa, { q, a: answer.slice(0, 200) }] };
-      saveMystery(next); setMystery(next);
-    } catch (e: any) {
-      addToast(e?.message || '问答失败', 'error');
-    } finally { setBusy(false); }
+    const q = question.trim();
+    setQuestion('');
+    void runHogwartsTask({
+      kind: 'recreation',
+      label: '禁林悬案 · 提问',
+      run: () => runMysteryAsk({ characters, apiConfig, userProfile }, q),
+    });
   };
 
   const accuse = async () => {
     if (!mystery || !guess) return;
-    const correct = guess === mystery.truth.split(/[，。,!！?？]/)[0]?.includes(guess) || mystery.truth.includes(guess);
+    const correct = mystery.truth.includes(guess) || Boolean(mystery.truth.split(/[，。,!！?？]/)[0]?.includes(guess));
     const next: MysteryState = { ...mystery, solved: correct ? 'right' : 'wrong' };
     saveMystery(next); setMystery(next);
     if (correct) {
@@ -397,7 +439,7 @@ const MysteryTab: React.FC<{ characters: any[]; apiConfig: any; userProfile: any
                 <input value={guess} onChange={e => setGuess(e.target.value)} placeholder="我认为是……" className="flex-1 bg-slate-50 rounded-full px-4 py-2 text-sm outline-none" />
                 <button onClick={accuse} disabled={!guess.trim()} className="bg-amber-500 disabled:opacity-40 text-white text-xs font-bold px-4 rounded-full">指认</button>
               </div>
-              <button onClick={() => { const n = { ...mystery, solved: 'wrong' }; saveMystery(n); setMystery(n); }} className="text-[10px] text-slate-400 underline">直接揭晓真相</button>
+              <button onClick={() => { const n: MysteryState = { ...mystery, solved: 'wrong' }; saveMystery(n); setMystery(n); }} className="text-[10px] text-slate-400 underline">直接揭晓真相</button>
             </div>
           )}
         </>
