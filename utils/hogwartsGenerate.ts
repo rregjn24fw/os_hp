@@ -12,6 +12,9 @@ import { resolveFeatureAiConfig, loadStylePreset } from './hogwarts';
 
 type GlobalApi = { baseUrl: string; apiKey: string; model: string };
 
+/** 内部标记：这个错误值得原地重试一次（渠道抖动），而不是直接抛给用户。 */
+interface RetryableError extends Error { retryable?: boolean }
+
 export interface HogwartsGenerateOptions {
   feature: 'novel' | 'forum' | 'campus' | 'extras';
   globalApi: GlobalApi;
@@ -54,49 +57,69 @@ export async function hogwartsGenerate(opts: HogwartsGenerateOptions): Promise<s
   // 「正在续写…」，用户分不清是慢还是失败，数据也永远落不了库。超时抛错，
   // 由任务层转成可见的错误提示（并写进系统日志），至少知道该重试。
   const timeoutMs = opts.timeoutMs ?? 200_000;
-  const controller = new AbortController();
-  const timer = setTimeout(() => {
-    try { controller.abort(new DOMException(`生成超时（${Math.round(timeoutMs / 1000)} 秒没有响应）`, 'TimeoutError')); } catch { /* 老浏览器不支持 reason */ }
-  }, timeoutMs);
+
+  const attempt = async (): Promise<string> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      try { controller.abort(new DOMException(`生成超时（${Math.round(timeoutMs / 1000)} 秒没有响应）`, 'TimeoutError')); } catch { /* 老浏览器不支持 reason */ }
+    }, timeoutMs);
+    try {
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${cfg.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: cfg.model || opts.globalApi.model,
+          messages,
+          // 温度优先级：调用方显式指定 > 酒馆预设 > 功能级配置 > 默认
+          temperature: opts.temperature ?? style?.temperature ?? cfg.temperature ?? 0.85,
+          max_tokens: cfg.maxTokens ?? opts.maxTokens ?? 2000,
+        }),
+        signal: controller.signal,
+        __sullyMeta: {
+          appId: `hogwarts-${opts.feature}`,
+          appName: '霍格沃茨',
+          purpose: '霍格沃茨主题生成',
+        },
+      } as RequestInit);
+
+      if (!response.ok) {
+        const detail = await response.text().catch(() => '');
+        const failure: RetryableError = new Error(`生成失败 (${response.status})：${detail.slice(0, 120)}`);
+        // 5xx / 429 是渠道侧抖动，值得再来一次；4xx 是配置或参数问题，重试只会再错一遍。
+        failure.retryable = response.status >= 500 || response.status === 429;
+        throw failure;
+      }
+      const data = await safeResponseJson(response);
+      const content = data.choices?.[0]?.message?.content;
+      if (typeof content !== 'string' || !content.trim()) {
+        throw new Error('模型未返回有效内容（多半是被 max_tokens 截断，或渠道只回了思考过程），可以重试或把字数调小');
+      }
+      return content.trim();
+    } catch (e: any) {
+      if (controller.signal.aborted) {
+        // 超时不重试：渠道已经卡住，再来一次多半还是卡 200 秒。
+        throw new Error(`生成超时（${Math.round(timeoutMs / 1000)} 秒没有响应），换个时间或换个渠道再试`);
+      }
+      // fetch 在网络层失败会抛 TypeError（Failed to fetch），这类抖动重试一次常常就好了。
+      if (e?.name === 'TypeError') {
+        const failure: RetryableError = new Error(`网络请求失败：${e.message || 'Failed to fetch'}`);
+        failure.retryable = true;
+        throw failure;
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 
   try {
-    const response = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${cfg.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: cfg.model || opts.globalApi.model,
-        messages,
-        // 温度优先级：调用方显式指定 > 酒馆预设 > 功能级配置 > 默认
-        temperature: opts.temperature ?? style?.temperature ?? cfg.temperature ?? 0.85,
-        max_tokens: cfg.maxTokens ?? opts.maxTokens ?? 2000,
-      }),
-      signal: controller.signal,
-      __sullyMeta: {
-        appId: `hogwarts-${opts.feature}`,
-        appName: '霍格沃茨',
-        purpose: '霍格沃茨主题生成',
-      },
-    } as RequestInit);
-
-    if (!response.ok) {
-      const detail = await response.text().catch(() => '');
-      throw new Error(`生成失败 (${response.status})：${detail.slice(0, 120)}`);
-    }
-    const data = await safeResponseJson(response);
-    const content = data.choices?.[0]?.message?.content;
-    if (typeof content !== 'string' || !content.trim()) {
-      throw new Error('模型返回了空内容（多半是被 max_tokens 截断或渠道只回了思考过程），可以重试或把字数调小');
-    }
-    return content.trim();
+    return await attempt();
   } catch (e: any) {
-    if (controller.signal.aborted) {
-      throw new Error(`生成超时（${Math.round(timeoutMs / 1000)} 秒没有响应），换个时间或换个渠道再试`);
-    }
-    throw e;
-  } finally {
-    clearTimeout(timer);
+    if (!e?.retryable) throw e;
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    return await attempt();
   }
 }
