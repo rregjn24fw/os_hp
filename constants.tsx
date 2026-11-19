@@ -88,6 +88,7 @@ export const Icons: Record<string, React.FC<{ className?: string }>> = {
   Campus: ({ className }) => <GraduationCap className={className} weight="regular" />,
   Forum: ({ className }) => <ChatsCircle className={className} weight="regular" />,
   Recreation: ({ className }) => <DiceFive className={className} weight="regular" />,
+  Extras: ({ className }) => <Books className={className} weight="regular" />,
 };
 
 export const INSTALLED_APPS: AppConfig[] = [
@@ -134,6 +135,7 @@ export const INSTALLED_APPS: AppConfig[] = [
   { id: AppID.Campus, name: '霍格沃茨', icon: 'Campus', color: 'indigo' },
   { id: AppID.Forum, name: '猫头鹰邮报', icon: 'Forum', color: 'emerald' },
   { id: AppID.Recreation, name: '翻倒巷', icon: 'Recreation', color: 'violet' },
+  { id: AppID.Extras, name: '彼豆故事集', icon: 'Extras', color: 'amber' },
   // { id: AppID.QQBridge, name: 'QQ 桥', icon: 'QQBridge', color: 'sky' }, // Hidden temporarily
 ];
 

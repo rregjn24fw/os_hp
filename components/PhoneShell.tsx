@@ -76,6 +76,7 @@ const ShopApp = lazyApp(() => import('../apps/ShopApp'));
 const CampusApp = lazyApp(() => import('../apps/CampusApp'));
 const ForumApp = lazyApp(() => import('../apps/ForumApp'));
 const RecreationApp = lazyApp(() => import('../apps/RecreationApp'));
+const ExtrasApp = lazyApp(() => import('../apps/ExtrasApp'));
 
 // 仅供「桌面稳定后的空闲串行预热」。严格 await 前一个再取下一个，且任何用户操作都会停止队列。
 // 高频 App 在前；低端设备/省流量/2G 由 shouldUseIdleAppPreload 整体跳过。
@@ -86,7 +87,7 @@ const APP_IDLE_PRELOAD_ORDER: PreloadableLazy[] = [
   VRWorldApp, WorldHomeApp, LifeSimApp, SongwritingApp, GuidebookApp, FAQApp, HotNewsApp,
   XhsStockApp, XhsFreeRoamApp, BrowserApp, VoiceDesignerApp, ThemeMaker, QQBridge,
   SpecialMomentsApp, CharCreatorDevApp,
-  HouseApp, ShopApp, CampusApp, ForumApp, RecreationApp,
+  HouseApp, ShopApp, CampusApp, ForumApp, RecreationApp, ExtrasApp,
 ];
 
 const IDLE_PRELOAD_START_MS = 600;
@@ -110,7 +111,7 @@ const APP_BY_ID: Partial<Record<AppID, PreloadableLazy>> = {
   [AppID.Handbook]: HandbookApp, [AppID.QQBridge]: QQBridge, [AppID.HotNews]: HotNewsApp,
   [AppID.VRWorld]: VRWorldApp, [AppID.CharCreatorDev]: CharCreatorDevApp, [AppID.SpecialMoments]: SpecialMomentsApp,
   [AppID.WorldHome]: WorldHomeApp,
-  [AppID.House]: HouseApp, [AppID.Shop]: ShopApp, [AppID.Campus]: CampusApp, [AppID.Forum]: ForumApp, [AppID.Recreation]: RecreationApp,
+  [AppID.House]: HouseApp, [AppID.Shop]: ShopApp, [AppID.Campus]: CampusApp, [AppID.Forum]: ForumApp, [AppID.Recreation]: RecreationApp, [AppID.Extras]: ExtrasApp,
 };
 // AppIcon 的 pointerdown 只预取用户正在点的 App；失败时由 preloadableLazy 清缓存，点击可正常重试。
 setAppPayloadWarmer((id: AppID) => APP_BY_ID[id]?.preload());
@@ -1073,6 +1074,7 @@ const PhoneShell: React.FC = () => {
       case AppID.Campus: return <CampusApp />;
       case AppID.Forum: return <ForumApp />;
       case AppID.Recreation: return <RecreationApp />;
+      case AppID.Extras: return <ExtrasApp />;
       case AppID.Launcher:
       default: return <Launcher />;
     }

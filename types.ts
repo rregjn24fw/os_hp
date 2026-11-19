@@ -44,6 +44,7 @@ export enum AppID {
   Campus = 'campus', // 霍格沃茨校园 — 回合制课程/学院活动模拟
   Forum = 'forum', // 猫头鹰论坛 — 按学院分版的校内论坛
   Recreation = 'recreation', // 娱乐室 — 决斗俱乐部 / 时间胶囊 / 禁林悬案
+  Extras = 'extras', // 彼豆故事集 — 基于角色生成番外短篇，可导出 TXT / EPUB
 }
 
 // =====================================================================
@@ -124,6 +125,15 @@ export interface CampusState {
   /** 事件流水。 */
   log: Array<{ id: string; day: number; period: string; text: string; at: number }>;
   characters: Array<{ charId: string; name: string; houseId?: HouseId; mood: string }>;
+  /** 沉浸式群像演绎消息流（酒馆聊天式：旁白 / 教授 / NPC 同学 / 用户）。 */
+  messages?: Array<{
+    id: string;
+    role: 'narration' | 'professor' | 'npc' | 'user';
+    speaker: string;
+    houseId?: HouseId;
+    text: string;
+    at: number;
+  }>;
   updatedAt: number;
 }
 
@@ -140,6 +150,7 @@ export interface FeatureAiSettings {
   novel: FeatureAiConfig;
   forum: FeatureAiConfig;
   campus: FeatureAiConfig;
+  extras?: FeatureAiConfig;
 }
 
 export interface SystemLog {

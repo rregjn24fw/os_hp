@@ -1,12 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import { useOS } from '../../context/OSContext';
 import { loadFeatureAiSettings, saveFeatureAiSettings } from '../../utils/hogwarts';
-import type { FeatureAiSettings, FeatureAiConfig } from '../types';
+import type { FeatureAiSettings, FeatureAiConfig } from '../../types';
 
 const FEATURES: Array<{ key: keyof FeatureAiSettings; label: string; desc: string }> = [
   { key: 'novel', label: '📖 同人文', desc: '小说续写 / 同人生成' },
   { key: 'forum', label: '🦉 猫头鹰论坛', desc: '角色自动发帖' },
   { key: 'campus', label: '🏰 霍格沃茨校园', desc: '校园回合演绎' },
+  { key: 'extras', label: '✨ 彼豆故事集', desc: '番外短篇生成 / 导出' },
 ];
 
 const HogwartsAiSettingsPanel: React.FC = () => {
@@ -64,7 +65,7 @@ const HogwartsAiSettingsPanel: React.FC = () => {
               </div>
             );
           })}
-          <button onClick={() => { saveFeatureAiSettings({ novel: {}, forum: {}, campus: {} }); setSettings({ novel: {}, forum: {}, campus: {} }); }}
+          <button onClick={() => { saveFeatureAiSettings({ novel: {}, forum: {}, campus: {}, extras: {} }); setSettings({ novel: {}, forum: {}, campus: {}, extras: {} }); }}
             className="w-full py-2 rounded-xl bg-slate-100 text-slate-500 text-xs active:scale-95 transition-transform">
             全部重置为跟随全局
           </button>

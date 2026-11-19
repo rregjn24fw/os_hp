@@ -22,6 +22,7 @@ const KEY = {
   campus: 'hogwarts_campus_state',
   forum: 'hogwarts_forum_state',
   ai: 'hogwarts_ai_settings',
+  extras: 'hogwarts_extras',
 } as const;
 
 function read<T>(key: string, fallback: T): T {
@@ -419,13 +420,37 @@ export function forumTimeContext(now = new Date()): ForumTimeContext {
   return { period, periodLabel, seasonLabel, weekend: day === 0 || day === 6, sceneHint };
 }
 
-/** 把时代语境拼进发帖指令（ForumApp / 测试共用）。 */
-export function forumEraInstruction(ctx: ForumTimeContext, charHint?: string): string {
+/** 把时代语境拼进发帖指令（ForumApp / 测试共用）。
+ * eraId 非 'auto' 时用固定时代设定覆盖真实时间推导（用户自选：亲时代 / 子时代 / 战后 等）。 */
+export function forumEraInstruction(ctx: ForumTimeContext, charHint?: string, eraId = 'auto'): string {
+  const era = FORUM_ERAS.find(e => e.id === eraId && e.id !== 'auto');
+  const timeLine = era
+    ? `${era.label}设定：${era.hint}`
+    : `现在是${ctx.seasonLabel}学期${ctx.periodLabel}（${ctx.weekend ? '周末' : '工作日'}），霍格沃茨的当下氛围：${ctx.sceneHint}`;
   return [
-    `现在是${ctx.seasonLabel}学期${ctx.periodLabel}（${ctx.weekend ? '周末' : '工作日'}），霍格沃茨的当下氛围：${ctx.sceneHint}`,
-    '帖子内容必须贴合这个时刻正在发生的事。',
+    timeLine,
+    era ? '帖子内容必须严格贴合这个时代的世界观，不得出现该时代尚未发生的事件、人物或事物。' : '帖子内容必须贴合这个时刻正在发生的事。',
     ...(charHint ? [charHint] : []),
   ].join('\n');
+}
+
+/** 用户可选的论坛时间线时代。'auto' 跟随真实时间，其余为固定时代设定。 */
+export const FORUM_ERAS: Array<{ id: string; label: string; hint: string }> = [
+  { id: 'auto', label: '跟随现实时间', hint: '' },
+  { id: 'marauders', label: '亲时代（劫盗者）', hint: '现在是1970年代中期，詹姆·波特、小天狼星布莱克、卢平、彼得·佩迪鲁（劫盗者）还在霍格沃茨念书，伏地魔与食死徒的阴影正悄然蔓延，邓布利多任校长。' },
+  { id: 'trio', label: '子时代（三人组）', hint: '现在是1990年代原著主线时期，哈利·波特、罗恩、赫敏等人在校，魔法界的危机时隐时现。' },
+  { id: 'postwar', label: '战后重建', hint: '现在是1998年霍格沃茨大战结束后不久，魔法界满目疮痍正在重建，金斯莱·沙克尔出任部长，霍格沃茨在修复中重新开学。' },
+  { id: 'nextgen', label: '新生代', hint: '现在是2017年之后，新一代（阿不思·波特、斯科皮·马尔福、罗丝·格兰杰-韦斯莱等）在霍格沃茨念书，魔法界和平繁荣。' },
+];
+
+const FORUM_ERA_KEY = 'hogwarts_forum_era';
+
+export function loadForumEra(): string {
+  try { return localStorage.getItem(FORUM_ERA_KEY) || 'auto'; } catch { return 'auto'; }
+}
+
+export function saveForumEra(id: string): void {
+  try { localStorage.setItem(FORUM_ERA_KEY, FORUM_ERAS.some(e => e.id === id) ? id : 'auto'); } catch { /* ignore */ }
 }
 
 /** 学院随机学生 NPC 池（与用户角色互不冲突，前缀避免撞 ID）。 */
@@ -480,4 +505,96 @@ export function resolveFeatureAiConfig(
     temperature: local.temperature,
     maxTokens: local.maxTokens,
   };
+}
+
+// ---------------------------------------------------------------------------
+// 彼豆故事集（番外生成）：章节式短篇，支持导出 TXT / EPUB
+// ---------------------------------------------------------------------------
+
+export interface ExtrasChapter {
+  title: string;
+  /** 纯文学散文正文，导出前后端都不会再加工。 */
+  content: string;
+}
+
+export interface ExtrasStory {
+  id: string;
+  title: string;
+  charId: string;
+  charName: string;
+  /** 番外主题提示（用户输入，可空）。 */
+  topic?: string;
+  chapters: ExtrasChapter[];
+  createdAt: number;
+}
+
+export function loadExtrasStories(): ExtrasStory[] {
+  const fallback = { stories: [] as ExtrasStory[] };
+  try {
+    const raw = localStorage.getItem(KEY.extras);
+    if (!raw) return fallback.stories;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed?.stories) ? (parsed.stories as ExtrasStory[]) : fallback.stories;
+  } catch {
+    return fallback.stories;
+  }
+}
+
+export function saveExtrasStories(stories: ExtrasStory[]): void {
+  try { localStorage.setItem(KEY.extras, JSON.stringify({ stories })); } catch (e) { console.warn('[hogwarts] 番外持久化失败', e); }
+}
+
+/** 解析模型番外输出：提取 JSON {title, chapters}；兜底把整段文本作为单章。 */
+export function parseExtrasGeneration(raw: string, charName: string): { title: string; chapters: ExtrasChapter[] } {
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (match) {
+    try {
+      const parsed = JSON.parse(match[0]);
+      const chapters = Array.isArray(parsed.chapters)
+        ? parsed.chapters
+            .map((c: any) => ({ title: String(c?.title || '').slice(0, 60), content: String(c?.content || c?.text || '').trim() }))
+            .filter((c: ExtrasChapter) => c.content.length > 0)
+        : [];
+      if (chapters.length > 0) {
+        return { title: String(parsed.title || `${charName}的番外`).slice(0, 60), chapters };
+      }
+    } catch { /* 落到文本兜底 */ }
+  }
+  return { title: `${charName}的番外`, chapters: [{ title: '', content: raw.trim() }] };
+}
+
+/** 解析模型输出的群像消息 JSON；失败兜底为旁白单条（CampusApp 沉浸演绎 / 测试共用）。 */
+export function parseSceneMessages(
+  raw: string,
+): Array<{ role: 'narration' | 'professor' | 'npc' | 'user'; speaker: string; houseId?: HouseId; text: string }> {
+  const match = raw.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+  if (match) {
+    try {
+      const parsed = JSON.parse(match[0]);
+      const arr: any[] = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.messages) ? parsed.messages : []);
+      const msgs = arr
+        .map((m: any) => ({
+          role: (['narration', 'professor', 'npc', 'user'].includes(m?.role) ? m.role : 'narration') as 'narration' | 'professor' | 'npc' | 'user',
+          speaker: String(m?.speaker || 'GM').slice(0, 20),
+          houseId: (typeof m?.houseId === 'string' ? m.houseId : undefined) as HouseId | undefined,
+          text: String(m?.text || '').trim(),
+        }))
+        .filter(m => m.text.length > 0);
+      if (msgs.length > 0) return msgs;
+    } catch { /* 兜底 */ }
+  }
+  return [{ role: 'narration', speaker: 'GM', text: raw.trim() }];
+}
+
+/** 导出前清扫：剥掉 markdown/代码痕迹，保证 TXT / EPUB 是干净可读的散文。 */
+export function sanitizeProse(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/^\s*[-*+]\s+/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }

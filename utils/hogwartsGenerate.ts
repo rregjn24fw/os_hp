@@ -13,7 +13,7 @@ import { resolveFeatureAiConfig } from './hogwarts';
 type GlobalApi = { baseUrl: string; apiKey: string; model: string };
 
 export interface HogwartsGenerateOptions {
-  feature: 'novel' | 'forum' | 'campus';
+  feature: 'novel' | 'forum' | 'campus' | 'extras';
   globalApi: GlobalApi;
   char?: CharacterProfile;
   userProfile: { name: string; [key: string]: any };
