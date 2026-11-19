@@ -70,7 +70,7 @@ const AppIcon: React.FC<AppIconProps> = React.memo(({ app, onClick, size = 'md',
         >
           {hasPainterly ? (
             <img
-              src={customIconUrl || `/assets/hogwarts/icons/${app.id}.webp`}
+              src={customIconUrl || `${import.meta.env.BASE_URL}assets/hogwarts/icons/${app.id}.webp`}
               className="w-full h-full object-cover"
               alt={app.name}
               loading="lazy"
