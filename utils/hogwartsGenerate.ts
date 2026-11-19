@@ -8,7 +8,7 @@
 import { ContextBuilder } from './context';
 import { safeResponseJson } from './safeApi';
 import type { CharacterProfile } from '../types';
-import { resolveFeatureAiConfig } from './hogwarts';
+import { resolveFeatureAiConfig, loadStylePreset } from './hogwarts';
 
 type GlobalApi = { baseUrl: string; apiKey: string; model: string };
 
@@ -29,16 +29,22 @@ export async function hogwartsGenerate(opts: HogwartsGenerateOptions): Promise<s
   const baseUrl = (cfg.baseUrl || opts.globalApi.baseUrl).replace(/\/+$/, '');
   if (!baseUrl || !cfg.apiKey) throw new Error('请先在设置里填写 API 地址与密钥');
 
+  // 全局酒馆文风预设：启用时注入所有霍格沃茨生成（番外/论坛/校园），文风与温度随之生效。
+  const style = loadStylePreset();
+  const systemContent = style?.prompt
+    ? `【全局文风预设 · ${style.name}（以下指令必须遵守）】\n${style.prompt}\n\n【本功能指令】\n${opts.instructions}`
+    : opts.instructions;
+
   const messages = opts.char
     ? await ContextBuilder.buildCharacterRequest(
         { char: opts.char, user: opts.userProfile as any },
         [
-          { role: 'system', content: opts.instructions },
+          { role: 'system', content: systemContent },
           { role: 'user', content: opts.userInput },
         ] as any,
       )
     : ([
-        { role: 'system', content: opts.instructions },
+        { role: 'system', content: systemContent },
         { role: 'user', content: opts.userInput },
       ] as any[]);
 
@@ -51,7 +57,8 @@ export async function hogwartsGenerate(opts: HogwartsGenerateOptions): Promise<s
     body: JSON.stringify({
       model: cfg.model || opts.globalApi.model,
       messages,
-      temperature: cfg.temperature ?? opts.temperature ?? 0.85,
+      // 温度优先级：调用方显式指定 > 酒馆预设 > 功能级配置 > 默认
+      temperature: opts.temperature ?? style?.temperature ?? cfg.temperature ?? 0.85,
       max_tokens: cfg.maxTokens ?? opts.maxTokens ?? 2000,
     }),
     __sullyMeta: {

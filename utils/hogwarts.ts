@@ -598,3 +598,36 @@ export function sanitizeProse(text: string): string {
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
+
+// ---------------------------------------------------------------------------
+// 全局文风预设：导入酒馆预设后，其 system 指令注入所有霍格沃茨生成
+// （番外 / 论坛 / 校园），采样温度也随预设生效。
+// ---------------------------------------------------------------------------
+
+export interface HogwartsStylePreset {
+  name: string;
+  /** 预设中启用的、非槽位 marker 的 system 指令合并文本。 */
+  prompt: string;
+  /** 预设采样温度（可空）。 */
+  temperature?: number;
+  importedAt: number;
+}
+
+const STYLE_PRESET_KEY = 'hogwarts_style_preset';
+
+export function loadStylePreset(): HogwartsStylePreset | null {
+  try {
+    const raw = localStorage.getItem(STYLE_PRESET_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed.prompt === 'string' && parsed.prompt.trim() ? parsed as HogwartsStylePreset : null;
+  } catch { return null; }
+}
+
+export function saveStylePreset(p: HogwartsStylePreset): void {
+  try { localStorage.setItem(STYLE_PRESET_KEY, JSON.stringify(p)); } catch (e) { console.warn('[hogwarts] 文风预设持久化失败', e); }
+}
+
+export function clearStylePreset(): void {
+  try { localStorage.removeItem(STYLE_PRESET_KEY); } catch { /* ignore */ }
+}

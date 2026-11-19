@@ -7,16 +7,43 @@ import { useOS } from '../context/OSContext';
 import { hogwartsGenerate } from '../utils/hogwartsGenerate';
 import {
   loadExtrasStories, saveExtrasStories, parseExtrasGeneration, sanitizeProse,
-  type ExtrasStory,
+  loadStylePreset, saveStylePreset, clearStylePreset, type ExtrasStory,
 } from '../utils/hogwarts';
+import { parseSillyTavernPreset } from '../utils/sillyTavernPreset';
 import { HOUSE_META } from '../utils/hogwarts';
 import type { HouseId } from '../types';
 
 const LENGTH_OPTIONS = [
-  { id: 'short', label: '短篇 · 1章', chapters: 1, words: 800 },
-  { id: 'medium', label: '中篇 · 2-3章', chapters: 3, words: 900 },
-  { id: 'long', label: '长篇 · 4-6章', chapters: 5, words: 1000 },
+  { id: 'short', label: '短篇 · 1章', chapters: 1 },
+  { id: 'medium', label: '中篇 · 3章', chapters: 3 },
+  { id: 'long', label: '长篇 · 5章', chapters: 5 },
 ];
+
+function buildContinuePrompt(story: ExtrasStory, eraHint?: string): string {
+  const prev = story.chapters
+    .map((c, i) => `第${i + 1}章 ${c.title || ''}\n${c.content}`)
+    .join('\n\n');
+  return `你是一位文笔出色的奇幻小说作者，正在为霍格沃茨魔法世界的一篇番外短篇续写下一章。
+
+### 主角
+${story.charName}（保持角色原有人设、语气与魔力特长）
+
+${eraHint ? `### 时代背景\n${eraHint}\n` : ''}
+### 已有正文
+${prev}
+
+### 续写要求
+1. 顺着已有情节自然续写第 ${story.chapters.length + 1} 章，衔接上一章结尾，剧情继续推进，不要重复已有内容。
+2. 本章正文约 900 字，有场景、有对话、有推进。
+3. ${PROSE_RULES}
+4. 严格输出 JSON，不要输出任何其他内容：
+\`\`\`json
+{
+  "title": "新章标题",
+  "content": "新章正文"
+}
+\`\`\``;
+}
 
 const PROSE_RULES = [
   '正文必须是纯文学散文，不得包含任何 markdown 标记（#、*、-、`）、HTML、代码、表格、表情符号或括号注解。',
@@ -198,13 +225,47 @@ const ExtrasApp: React.FC = () => {
   const [charId, setCharId] = useState('');
   const [topic, setTopic] = useState('');
   const [lengthId, setLengthId] = useState('short');
+  const [wordsPer, setWordsPer] = useState(900);
   const [busy, setBusy] = useState(false);
   const [reading, setReading] = useState<ExtrasStory | null>(null);
   const [chapterIdx, setChapterIdx] = useState(0);
+  const [stylePreset, setStylePreset] = useState(() => loadStylePreset());
+  const styleInputRef = useRef<HTMLInputElement>(null);
   const genRef = useRef(0);
 
   const selectedChar = characters.find(c => c.id === charId);
   const persist = (s: ExtrasStory[]) => { saveExtrasStories(s); setStories(s); };
+
+  /** 导入酒馆预设为全局文风：解析启用的 system 指令 + 采样温度。 */
+  const handleImportStyle = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = parseSillyTavernPreset(text, file.name);
+      const prompts = parsed.document?.prompts || [];
+      const generation = parsed.document?.generation;
+      const prompt = prompts
+        .filter(p => p.enabled && !p.marker && p.content.trim() && p.role === 'system')
+        .map(p => p.content.trim())
+        .join('\n\n');
+      if (!prompt.trim()) throw new Error('预设里没有可用的文风指令（全部是槽位或已禁用）');
+      const preset = { name: parsed.document?.name || file.name.replace(/\.json$/i, ''), prompt, temperature: generation?.temperature, importedAt: Date.now() };
+      saveStylePreset(preset);
+      setStylePreset(preset);
+      addToast(`文风预设「${preset.name}」已启用，对所有霍格沃茨生成生效`, 'success');
+    } catch (err: any) {
+      addToast(err?.message || '预设导入失败', 'error');
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  const handleClearStyle = () => {
+    clearStylePreset();
+    setStylePreset(null);
+    addToast('已清除文风预设，恢复默认文风', 'success');
+  };
 
   const handleGenerate = async () => {
     if (busy) return;
@@ -213,6 +274,7 @@ const ExtrasApp: React.FC = () => {
     const gen = ++genRef.current;
     try {
       const len = LENGTH_OPTIONS.find(l => l.id === lengthId) || LENGTH_OPTIONS[0];
+      const words = Math.min(Math.max(Math.round(wordsPer) || 900, 300), 4000);
       const house = (selectedChar as any).houseId as HouseId | undefined;
       const eraHint = house ? `角色属于${HOUSE_META[house].cn}学院` : '';
       const raw = await hogwartsGenerate({
@@ -223,11 +285,11 @@ const ExtrasApp: React.FC = () => {
           charName: selectedChar.name,
           topic: topic.trim(),
           chapterCount: len.chapters,
-          wordsPer: len.words,
+          wordsPer: words,
           eraHint,
         }),
-        userInput: `请以 ${selectedChar.name} 为主角，写一篇${len.label.split(' · ')[0]}番外${topic.trim() ? `，主题：${topic.trim()}` : ''}。`,
-        maxTokens: 2000 * len.chapters,
+        userInput: `请以 ${selectedChar.name} 为主角，写一篇${len.chapters}章的番外${topic.trim() ? `，主题：${topic.trim()}` : ''}，每章约${words}字。`,
+        maxTokens: Math.max(2000, Math.ceil(words * 1.8) * len.chapters),
       });
       if (gen !== genRef.current) return;
       const parsed = parseExtrasGeneration(raw, selectedChar.name);
@@ -255,6 +317,42 @@ const ExtrasApp: React.FC = () => {
   const handleDelete = (id: string) => {
     persist(loadExtrasStories().filter(s => s.id !== id));
     if (reading?.id === id) { setReading(null); setView('list'); }
+  };
+
+  /** 续写下一章：以已有全部章节为上下文，生成后追加进同一篇并自动存档。 */
+  const handleContinue = async () => {
+    if (!reading || busy) return;
+    setBusy(true);
+    const gen = ++genRef.current;
+    try {
+      const house = (characters.find(c => c.id === reading.charId) as any)?.houseId as HouseId | undefined;
+      const eraHint = house ? `角色属于${HOUSE_META[house].cn}学院` : '';
+      const raw = await hogwartsGenerate({
+        feature: 'extras', globalApi: apiConfig as any,
+        char: characters.find(c => c.id === reading.charId),
+        userProfile: userProfile as any,
+        instructions: buildContinuePrompt(reading, eraHint),
+        userInput: `请为《${reading.title}》续写第 ${reading.chapters.length + 1} 章。`,
+        maxTokens: 2500,
+      });
+      if (gen !== genRef.current) return;
+      const parsed = parseExtrasGeneration(raw, reading.charName);
+      const chapter = {
+        title: parsed.chapters[0]?.title || `第${reading.chapters.length + 1}章`,
+        content: sanitizeProse(parsed.chapters[0]?.content || ''),
+      };
+      if (!chapter.content) throw new Error('模型未返回有效正文');
+      const updated: ExtrasStory = { ...reading, chapters: [...reading.chapters, chapter] };
+      // 自动存档：同步进本地故事集
+      persist(loadExtrasStories().map(s => s.id === updated.id ? updated : s));
+      setReading(updated);
+      setChapterIdx(updated.chapters.length - 1);
+      addToast(`第${updated.chapters.length}章已续写并存档`, 'success');
+    } catch (e: any) {
+      addToast(e?.message || '续写失败', 'error');
+    } finally {
+      if (gen === genRef.current) setBusy(false);
+    }
   };
 
   const openStory = (s: ExtrasStory) => { setReading(s); setChapterIdx(0); setView('read'); };
@@ -314,7 +412,35 @@ const ExtrasApp: React.FC = () => {
                 </button>
               ))}
             </div>
+            <div className="flex items-center gap-2 mt-2">
+              <span className="text-[11px] text-amber-200/60 shrink-0">每章字数</span>
+              <input type="number" min={300} max={4000} step={100} value={wordsPer}
+                onChange={e => setWordsPer(Number(e.target.value) || 900)}
+                className="w-24 px-2.5 py-1.5 rounded-lg text-sm bg-white/5 border border-amber-200/20 text-amber-50 focus:outline-none" />
+              <span className="text-[10px] text-amber-200/40">300 - 4000，默认 900</span>
+            </div>
           </div>
+
+          {/* 全局文风预设（酒馆预设导入） */}
+          <div className="rounded-xl border border-amber-200/20 bg-white/5 px-3 py-2.5 space-y-2">
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-amber-200/60 flex-1">🖋 文风预设（全局）</span>
+              {stylePreset && <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-300 max-w-[10rem] truncate">{stylePreset.name}</span>}
+            </div>
+            {stylePreset && <div className="text-[10px] text-amber-200/40 line-clamp-2">{stylePreset.prompt.slice(0, 120)}…</div>}
+            <div className="flex gap-1.5">
+              <button onClick={() => styleInputRef.current?.click()}
+                className="px-2.5 py-1 rounded-lg bg-white/5 border border-amber-200/20 text-amber-200 text-[10px]">
+                导入酒馆预设 (.json)
+              </button>
+              {stylePreset && (
+                <button onClick={handleClearStyle} className="px-2.5 py-1 rounded-lg text-red-300/70 text-[10px]">清除</button>
+              )}
+            </div>
+            <div className="text-[10px] text-amber-200/30">导入后，预设里的 system 指令与采样温度会注入番外、论坛、校园的所有生成。</div>
+            <input type="file" ref={styleInputRef} accept=".json,application/json" onChange={handleImportStyle} className="hidden" />
+          </div>
+
           <button onClick={handleGenerate} disabled={busy}
             className="w-full py-3 rounded-xl bg-amber-400 text-[#0a130f] font-bold text-sm active:scale-95 transition-transform disabled:opacity-50">
             {busy ? '正在执笔……' : '✨ 开始写番外'}
@@ -331,7 +457,7 @@ const ExtrasApp: React.FC = () => {
         {renderTitleBar(reading.title, () => setView('list'))}
         <div className="flex-1 overflow-y-auto px-5 py-4 pb-10">
           <div className="text-center text-amber-200/50 text-[11px] mb-3">
-            {reading.charName} · {reading.chapters.length} 章 · {reading.chapters.reduce((n, c) => n + c.content.length, 0)} 字
+            {reading.charName} · {reading.chapters.length} 章 · {reading.chapters.reduce((n, c) => n + c.content.length, 0)} 字 · 自动存档
           </div>
           {reading.chapters.length > 1 && (
             <div className="flex gap-1.5 overflow-x-auto no-scrollbar pb-2 mb-2">
@@ -353,6 +479,10 @@ const ExtrasApp: React.FC = () => {
               下一章 ▶
             </button>
           )}
+          <button onClick={handleContinue} disabled={busy}
+            className="w-full mt-2 py-3 rounded-xl bg-amber-400 text-[#0a130f] font-bold text-sm active:scale-95 transition-transform disabled:opacity-50">
+            {busy ? '正在续写……' : '✍ 续写下一章'}
+          </button>
         </div>
       </div>
     );
