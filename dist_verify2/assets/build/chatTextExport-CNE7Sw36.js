@@ -1,0 +1,3 @@
+import{c6 as e}from"./useLocalBackHandler-5SZnNJaa.js";import"./vendor-capacitor-DtNwoD35.js";import"./vendor-react-BoKvikiE.js";import"./vendor-blob-store-t5gmMSH4.js";function a(i){return"\uFEFF"+[...i].filter(t=>e(t)&&(t.role==="user"||t.role==="assistant")).sort((t,o)=>t.timestamp-o.timestamp||t.id-o.id).map(t=>{const o=new Date(t.timestamp),r=Number.isFinite(o.getTime())?o.toLocaleString("sv-SE",{hour12:!1}):"时间未知",n=t.type==="image"?"[图片]":t.type==="emoji"?"[表情]":/^(?:blobref:|blob:|data:)/i.test(t.content||"")?"[附件]":t.type==="voice"?`[语音] ${t.content||""}`:t.content||"";return`[${r}] ${t.role==="user"?"User":"AI"}: ${n}`}).join(`
+
+`)}export{a as formatChatTextExport};

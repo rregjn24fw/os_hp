@@ -1,0 +1,2678 @@
+import React, { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import AmsgTabBar from './AmsgTabBar';
+import SettingsDetailPage, { focusSettingsBackIfNeeded } from './SettingsDetailPage';
+import AmsgConnectionTransfer, { type AmsgDiscoveryRequest } from './AmsgConnectionTransfer';
+import PushSubscriptionPanel from './PushSubscriptionPanel';
+import PushModeSelector from './PushModeSelector';
+import AmsgOverview from './AmsgOverview';
+import AmsgConnectionGate from './AmsgConnectionGate';
+import AmsgVisitedPanel from './AmsgVisitedPanel';
+import type { AmsgConnection } from '../../utils/amsgConnectionCode';
+import { detectCapacitorNative } from '../../utils/pushSubscribeShared';
+import { AmsgIcon } from './AmsgArtwork';
+import { useLocalBackHandler } from '../../hooks/useLocalBackHandler';
+import ConfirmDialog from '../os/ConfirmDialog';
+import AmsgIntroDemo from './AmsgIntroDemo';
+import { ActiveMsg2GlobalConfig, CharacterGroup, CharacterProfile, RealtimeConfig } from '../../types';
+import {
+  ActiveMsgClient, ActiveMsg2PushStatus, fetchWorkerDiagnostics, fetchWorkerTickReport, readAmsgFailKind,
+  type AmsgCronTriggerState,
+  type AmsgWorkerVersionProbe,
+} from '../../utils/activeMsgClient';
+import { describeAmsgSelfUpdate } from '../../utils/amsgSelfUpdateState';
+import {
+  AmsgDiagnosticLevel, AmsgDiagnosticsProbe, type AmsgTickReportResult,
+  buildAmsgDiagnosticRows, summarizeAmsgDiagnostics,
+  INSTANT_CHAT_BLOCKER_HINTS, resolveInstantChatBlocker,
+  type InstantChatGateInput,
+} from '../../utils/amsgDiagnostics';
+import { ActiveMsgStore, isInstantChatSwitchedOn, maskActiveMsgUserId } from '../../utils/activeMsgStore';
+import { showInstantChatSendHelp } from '../../utils/instantChatSendHelp';
+import { AMSG_GLOBAL_CONFIG_EVENT, isAmsg2GloballyEnabled, isAmsg2WorkerActive } from '../../utils/amsgGlobalGate';
+import { setAmsg2GlobalEnabled } from '../../utils/amsgGlobalSwitch';
+import { formatTaskTime } from '../../utils/amsg2Tasks';
+import { isWorkerUrlCleared } from '../../utils/amsgStateSync';
+import { rememberDetachedWorker } from '../../utils/amsgDetachedWorkers';
+import { generateClientToken } from '../../utils/vapidGen';
+import { loadPushVapid, savePushVapid } from '../../utils/pushVapid';
+import {
+  attachUpdateCapability,
+  AMSG_SCRIPT_NAME,
+  createAmsgReplacementPlan,
+  type AmsgReplacementPlan,
+  type ExistingAmsgBackend,
+  provisionAmsgBackend,
+  waitForWorkerReady,
+  type CfAccount,
+  type ProvisionProgress,
+} from '../../utils/cfProvision';
+import { isAmsgServerVersionAtLeast } from '../../utils/amsgWorkerVersion';
+import { trackEvent } from '../../utils/analytics';
+import {
+  canRelayWorkerUrl, fetchRelayUsage, getRelayDeploymentSource, isRelayTokenWellFormed, resolveWorkerFetchBase, type RelayUsageResult,
+} from '../../utils/amsgRelay';
+import { formatBytes } from '../../utils/format';
+import {
+  getThirdPartyPushProviderMeta,
+  THIRD_PARTY_PUSH_PROVIDERS,
+  validateThirdPartyPushConfig,
+  type ThirdPartyPushProvider,
+} from '../../utils/amsgThirdPartyPush';
+
+// 满血链路吃满这些 worker 特性（amsg-server 2.6.0-next.4+）。探测不到端点（老部署
+// 404 → null）或缺任何一项，就亮「重新部署」提示——worker 跑在用户自己的账号里，
+// 站点这边发新版不会自动同步过去。
+const REQUIRED_WORKER_FEATURES = [
+  'client-state',
+  'client-state-chunking',
+  'agentic-hooks',
+  'agentic-scratch',
+  // 后台 fire 每轮把 tools 参数带给 LLM（角色在主动消息里用得上用户自配的 MCP 工具）。
+  'agentic-fire-tools',
+  // hook 载荷自带 readState / writeState，配置级 hook 不用再自己攒一份写口。
+  'hook-state-accessors',
+  // onAfterSend 拿到本次 fire 的 scratch：自述回写按真正送出去的段数落账。
+  'after-send-scratch',
+  // 任务身份直接挂在 ctx 和 push 顶层，两条排程路径不用各抄一份 metadata。
+  'fire-task-identity',
+  'push-task-identity',
+  // 库导出信封余量常量，push 体积按「库补完字段之后」的尺寸算。
+  'push-envelope-reserved-bytes',
+  // 角色自排撞车时回已存在那行的投影，重跑那轮也记得下账。
+  'schedule-task-duplicate-row',
+  // 循环任务的过期快进也回调，攒下的那几次跳过在面板上看得见。
+  'recurring-stale-skip-hook',
+  // 任务行带时区，daily / weekly 按角色所在时区的墙钟推进。
+  'task-timezone',
+  // 推送订阅按用户存一份，排程不再携带；换订阅后已排的任务自动跟上。
+  'user-push-subscription',
+  // 凭据存成表里的一行、任务只带引用（credRefs）。换 Key 只要覆盖那一行，已排的任务
+  // ——包括角色在触发时给自己排的那些——下次触发就用新凭据。缺了它就退回「凭据冻结
+  // 进每条任务」的老路：换 Key 要逐条补刷，漏一条到点就是 401。
+  'llm-credentials',
+  // 即时对话通过正式策略关闭生成重试，收尾读取上游的 willRetry 决定。
+  'max-generation-retries',
+  // 即时任务绑定独立输入；后台按 key 读取、核对实际任务并保存不可变附件。
+  'task-input',
+  'client-state-key',
+  'agentic-list-tasks',
+  'agentic-tool-allowlist',
+  'attachments',
+];
+// features 之外还必须比版本：这波依赖的能力大多没发独立 flag，光查 features 分不出新旧。
+//   next.5 — GET /messages 投影（charId/clientTaskId）、onBeforeFire 的 { skip } 出口
+//   next.6 — 任务占位租约（带工具的 AI 任务常跑过一分钟，没有占位会被相邻 cron tick 重复推）
+//   next.7 — hook 的 writeState（大内容旁路存 client_state）、Web Push payload 大小护栏
+//   next.8 — fire 循环透传 tools 请求参数（后台调用户自配 MCP 的前置）
+//   next.9 — 这一档还兼做「bundle 里有没有自述回写」的判据：角色发完把正文记回
+//            client_state、下次到点接着说（fire_pack 的 self_log 槽位），是随本波
+//            bundle 一起上去的。旧 bundle 收到带槽位的 fire_pack 只会把
+//            `{{AMSG_SELF_LOG}}` 原样发给 LLM，而 SERVER_VERSION 是打包时那份
+//            amsg-server 的版本号，正好能把这类旧粘贴认出来。
+//   next.11 — 推送订阅改成按用户存一份：这一档起排程不再携带订阅，前端走
+//            /push-subscription 端点登记，旧 worker 上这个端点不存在。
+//   next.12 — 「角色说过什么」的落盘改挂在 onFireSettled 上（不论这次是发出去了、
+//            跳过了还是抛错了都调一次）。旧 worker 认不得这个 hook，会把它当成
+//            无关配置直接忽略——而 bundle 这边已经不再用 onAfterSend，表现就是
+//            self_log 永远不写：角色到点不知道自己上次说过什么，天天重复同一句。
+//            同一档还带 run-tick 的同角色任务串行（serializeBy）。
+//   next.15 — 这一档能力密集，而且 bundle 里的 wrapper 已经按新上游行为改写：
+//            即时对话 immediate 落库即到期 + supersedesUuid 原子顶替；llmExtraBody
+//            （思考链三件套上云）；租约心跳续租（wrapper 不再配 claimLeaseMs，旧
+//            上游没有心跳 → 退回 10 分钟死租约，isolate 死后任务干等）；fire ctx
+//            的 cancelTask / renewTask（角色取消 / 改期自己的排程）；client_state
+//            条件写（旧包不盖新包）；任务行 last_error（失败原因可查）。
+//   next.16 — 即时对话改由 Durable Object 起跳，靠的就是这一档的 runTask（按 uuid
+//            跑单条）；错误响应带 error.cause（真因不再只进 worker 日志）；
+//            getSchemaVersion（表结构对不对得上，由上游按自己的建表语句比对）。
+//   next.17 — 用户级 LLM 凭据表（PUT/GET/DELETE /llm-credentials）、任务的 credRefs、
+//            fire hook 的 resolveLlmCredential。这一档有独立 flag（上面那条
+//            'llm-credentials'），版本号列在这里只是备个案。
+//   next.20 — 推送被推送服务判死（410 / 404）时当终态，不再空转重试——投递是先生成
+//            后推送，每重试一跳就白跑一整轮 LLM；同时把状态码结构化写进 last_error
+//            的 pushStatus，体检的「这台设备」靠它拆穿「登记全绿但一条都不来」。
+//            另外 client_state 的前缀清理改走字典序范围：D1 把 LIKE pattern 压到
+//            50 字节（官方文档没写），key 一长就整条语句报 pattern too complex，
+//            同批的状态写入跟着一起回滚。
+//   next.21 — 带 body 的端点认 `Content-Encoding: gzip`：即时对话那条路上的正文
+//            （整轮聊天）在客户端压过再发，旧 worker 不认这个头，会把压缩字节当
+//            明文读，报出来是一句「请求体不是合法的 JSON」——大消息一条都发不出去。
+//            同一档还有失败记录里的 errorCode（`LLM_CALL_FAILED` 之类）和上游拒绝
+//            请求时的原话：卡片上那句「生成失败」从此说得出到底是模型名写错了、
+//            余额不够，还是订阅失效该去重新登记。
+//   next.23 — 跟着 amsg-shared 0.4.0-next.8 一起升：shared 的通知字段校验放行了
+//            `silent: 'when-visible'`（静音改由 Service Worker 按窗口可见性算）。
+//            server 侧没有行为变化，单升这一档不解决任何问题；这批真正要用户去点
+//            一次「更新 Worker」的是通知策略本身，见 utils/amsgBundleVersion.ts。
+//   next.26 — client_state 的条件写不再被「来自未来」的时间戳锁死。设备时钟只要
+//            领先过真实时间，那一刻同步上去的行就带着一个还没到的时刻，之后这台
+//            设备发什么都被判成「旧的」，云端那行要等真实时间追上来才解得开；用户
+//            侧的表现是某个角色的即时对话一直发不出去，删消息、重装、重填地址全都
+//            不管用。这一档两件事：库里那种行不再有拦人的资格（存量能被覆盖回来），
+//            以及新写入的护栏值钳到服务端当前时刻（不再产生新的脏行）。旧部署上前端
+//            的水位（utils/amsgStateClock.ts）能兜住发不出去这一半，但云端那行会一直
+//            停在未来，只有升上来才会第一次写入就回到现实。
+//   next.27 — 两件事。一、cron 每跳顺手跑的几条清理 DELETE 有了索引：client_state 和
+//            message_outbox 上原先没有对应的索引，每分钟整表扫一遍，扫过的行全算进
+//            D1 的 rows read，两张表合计一千七百行就把免费额度（每天 500 万行）用完，
+//            之后整个 worker 报「exceeded daily row read limit」、所有查询都拒。索引在
+//            用户点「重新连接并验证」（POST /init-tenant）时补上，「更新 Worker」会自动
+//            接一次。二、PUT /client-state 认 value: null 删行：客户端取回旁路存的大
+//            内容后把那行真的删掉，不再留空壳（即时对话每轮的键都是新的，空壳只涨不
+//            跌，worker 每次生成都要把整个角色命名空间读一遍）。前端接入见
+//            utils/activeMsgClient.ts 的 clearClientStateValue 与存量空壳清理。
+//   next.28 — 跟着 amsg-shared 0.4.0-next.10 一起升：中转站回 HTTP 200、响应体里却是
+//            报错时，按模型调用失败处理，原话写进 last_error、任务照常重试。旧 worker
+//            上这类响应被当成模型「这轮没说话」静默跳过，面板上只写「没写出要说的话」，
+//            看不出是中转站在报错。同一批还带上 0.4.0-next.9 的脱敏补漏：形状像模型名
+//            的自建网关 Key 不再明文进 last_error。
+//   next.31 — 正式支持按任务配置生成重试次数。即时对话设为 0，失败立即结束；
+//            已整批入箱的内容仍可补推。收尾通过 willRetry 读取上游决定，不修改错误对象。
+//            旧部署缺少这项策略，会继续让用户等自动重试，需更新 Worker。
+//   next.32 — 执行中的即时对话可取消，模型请求与工具循环共享取消信号。
+//   next.33 — onBeforeFire 可以推迟一次触发（{ defer }）。到点时页面正在本地生成回复，
+//            定时消息靠它等那一轮结束再生成。
+// 不比版本的话，旧粘贴部署会被误判为最新，问题全在 worker 侧静默发生。
+//
+// 3.1.0 修复云端数据清单与清理在分块大值与海量收件箱下的内存/CPU 耗尽；投递或某项清理出错时，
+// 其余库存清理照跑；D1 存储满与每日额度用完的报错带机读代码，界面能说清楚原因。
+const REQUIRED_WORKER_VERSION = '3.1.0';
+// 3.2.0-next 给任务占位加了租约令牌，并收紧了入参校验。前端没有用到新能力，门槛保持 3.1.0；
+// Worker 自动更新会带上新版，不必让旧部署重新粘贴。
+// 3.2.0-next.2 把解不开的旧数据报成 STORED_DATA_UNDECRYPTABLE。前端对新旧两种报法都认得，
+// 门槛同样不动。
+const WORKER_VERSION_LAG_ACK = '3.2.0-next.2';
+
+/** 手动配置的图文教程，只在用户展开「我要手动配置」后出现。 */
+const MANUAL_SETUP_TUTORIAL_URL = 'https://discord.com/channels/1487742660314923100/1533520151784460449';
+/** workers.dev 在当前网络连不上时怎么直连的教程，挂在 Worker 地址输入框下面。 */
+const DIRECT_CONNECT_TUTORIAL_URL = 'https://discord.com/channels/1487742660314923100/1536968535727677450';
+/** 一键部署要的那枚 API Token 在这里建。 */
+const CF_TOKEN_URL = 'https://dash.cloudflare.com/profile/api-tokens';
+
+// 浏览器的 SW ready 和存储读取都可能一直不返回，不能让配置入口跟着消失。
+const SETTINGS_CHECK_TIMEOUT_MS = 10_000;
+const waitForSettingsCheck = async <T,>(check: Promise<T>): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      check,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error('设置检查超时');
+          error.name = 'TimeoutError';
+          reject(error);
+        }, SETTINGS_CHECK_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+// 探测结果每次会话只报一次。refresh() 在开面板、连接成功、订阅成功后都会跑一遍，
+// 一个连不上、反复点「连接」的人否则能一个人刷出十几条同样的结果，把分布带歪。
+let workerCapsReported = false;
+// 「即时对话开不了卡在哪」同样每次会话只报一次，理由同上。
+let instantChatGateReported = false;
+
+/** 体检每一行的配色与那一列小字。unknown 用灰：查不出结论时别拿颜色暗示好坏。 */
+const DIAGNOSTIC_STYLES: Record<AmsgDiagnosticLevel, { dot: string; text: string; word: string }> = {
+  ok: { dot: 'bg-emerald-500', text: 'text-emerald-600', word: '正常' },
+  warn: { dot: 'bg-amber-500', text: 'text-amber-600', word: '注意' },
+  bad: { dot: 'bg-rose-500', text: 'text-rose-600', word: '有问题' },
+  unknown: { dot: 'bg-slate-300', text: 'text-slate-400', word: '查不到' },
+};
+
+/** 刚生成的密钥明文：输入框是 password 型，只能在这一处让用户看见并复制。 */
+const SecretReveal: React.FC<{ value: string; className?: string }> = ({ value, className = '' }) => {
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  useEffect(() => setCopyState('idle'), [value]);
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopyState('copied');
+    } catch {
+      setCopyState('failed');
+    }
+  };
+  return (
+    <div className={`flex items-start gap-2 bg-white border border-slate-200 rounded-xl px-2 py-1.5 ${className}`}>
+      {/* body 全局 user-select:none，这里得单独放开，否则连手动复制都做不到 */}
+      <p
+        className="flex-1 font-mono text-[10px] leading-relaxed text-slate-500 break-all"
+        style={{ userSelect: 'all', WebkitUserSelect: 'all' }}
+      >
+        {value}
+      </p>
+      <button
+        type="button"
+        onClick={() => void handleCopy()}
+        className="shrink-0 text-[10px] font-bold text-slate-500 active:scale-95 transition-transform"
+      >
+        {copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败' : '复制'}
+      </button>
+    </div>
+  );
+};
+
+/** 引导的四步（介绍页是第 0 屏，不算在里面）。 */
+const GUIDE_STEPS = ['装后端', '开通知', '即时对话', '给角色开启'];
+
+interface ActiveMsgGlobalSettingsModalProps {
+  isOpen: boolean;
+  covered?: boolean;
+  workspaceSection?: 'overview' | 'config' | 'push' | 'features';
+  connectionRequest?: number;
+  onSelectWorkspace?: (page: 'overview' | 'config' | 'push' | 'features') => void;
+  characters?: CharacterProfile[];
+  characterGroups?: CharacterGroup[];
+  onConfigureCharacter?: (id: string) => void;
+  onClose: () => void;
+  addToast: (message: string, type?: 'success' | 'error' | 'info') => void;
+  /** 「清空云端数据」清完要立刻把工具凭据补传回去，所以这里需要当前这份配置。 */
+  realtimeConfig: RealtimeConfig;
+  /** 由 Settings 注入：点「去推送凭据面板」时打开顶层 PushVapidSettingsModal */
+  onOpenVapid?: () => void;
+  /** 打开「云端数据」清点页（跟 onOpenVapid 一样，由设置页负责渲染那个面板）。 */
+  onOpenCloudData?: () => void;
+  onRestoreBackup?: () => void;
+  /** 由设置页传入的总开关处理器（带完整角色/API 上下文以便恢复时对齐快照）。 */
+  onToggleGlobalEnabled?: (next: boolean) => Promise<void>;
+  /** 暂停态下通过「重新连接 / 一键部署」直接恢复启用后，由设置页补刷角色与 API 快照。 */
+  onReenabledAfterConnect?: () => void;
+  onOpenPushStatus?: () => void;
+}
+
+const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> = ({
+  isOpen,
+  covered = false,
+  workspaceSection,
+  connectionRequest = 0,
+  onSelectWorkspace,
+  characters = [],
+  characterGroups = [],
+  onConfigureCharacter,
+  onClose,
+  addToast,
+  realtimeConfig,
+  onOpenVapid,
+  onOpenCloudData,
+  onRestoreBackup,
+  onToggleGlobalEnabled,
+  onReenabledAfterConnect,
+  onOpenPushStatus,
+}) => {
+  const [config, setConfig] = useState<ActiveMsg2GlobalConfig | null>(null);
+  const [configLoadError, setConfigLoadError] = useState('');
+  const configRequestIdRef = useRef(0);
+  const pushRequestIdRef = useRef(0);
+  const [loading, setLoading] = useState(false);
+  const [testPushResult, setTestPushResult] = useState<'idle' | 'sending' | 'sent' | 'failed'>('idle');
+  const [showNtfyInfo, setShowNtfyInfo] = useState(false);
+  useEffect(() => { setTestPushResult('idle'); }, [config?.workerUrl, config?.pushMode, config?.thirdPartyPush?.token]);
+  // 这次打开看哪一面：没连上后端的人走引导（介绍 → 三步），连上的直接进面板。
+  // 配置读回来时定一次、之后只由用户点按钮切换——引导走到一半连上了后端，不能把人直接甩进面板。
+  const [view, setView] = useState<'guide' | 'panel' | null>(null);
+  /** 引导走到第几屏：0 是介绍，1~4 对应 GUIDE_STEPS。 */
+  const [guideStep, setGuideStep] = useState(0);
+  const [panelTab, setPanelTab] = useState('worker');
+  const [featureTab, setFeatureTab] = useState('connection');
+  const connectionVisible = workspaceSection === 'config' || (workspaceSection === 'features' && featureTab === 'connection');
+  useEffect(() => { setFeatureTab('connection'); }, [connectionRequest]);
+  const initialDestinationChosen = useRef(false);
+  useEffect(() => {
+    if (!isOpen) { initialDestinationChosen.current = false; return; }
+    if (!config || initialDestinationChosen.current || !workspaceSection) return;
+    initialDestinationChosen.current = true;
+    if (!(config.initializedAt && config.workerUrl?.trim())) onSelectWorkspace?.('config');
+  }, [isOpen, config, workspaceSection, onSelectWorkspace]);
+  const [existingSetup, setExistingSetup] = useState(false);
+  const [reconfigure, setReconfigure] = useState<'choose' | 'review' | 'backend' | null>(null);
+  const reconfigureOrigin = useRef<{ view: 'guide' | 'panel' | null; step: number } | null>(null);
+  const [verifiedConnection, setVerifiedConnection] = useState<{ workerUrl: string; serverToken: string } | null>(null);
+  const [discoveryRequest, setDiscoveryRequest] = useState<AmsgDiscoveryRequest | null>(null);
+  const tabPrefix = useId();
+  const topRef = useRef<HTMLDivElement>(null);
+  // 只重置本页滚动：scrollIntoView 会在长页滚掉顶部 padding，短页却保留它，导致导航上下跳。
+  useLayoutEffect(() => {
+    if (!isOpen || covered) return;
+    const scroll = topRef.current?.closest('.amsg-detail-scroll');
+    if (scroll) scroll.scrollTop = 0;
+    focusSettingsBackIfNeeded(topRef.current);
+  }, [view, guideStep, panelTab, workspaceSection, featureTab, existingSetup, reconfigure]);
+  // 手动配置：只给明确不想走一键部署的人看，默认收着。
+  const [manualSetupOpen, setManualSetupOpen] = useState(false);
+  const [pushStatus, setPushStatus] = useState<ActiveMsg2PushStatus | null>(null);
+  const [checkingPush, setCheckingPush] = useState(false);
+  const [pushCheckError, setPushCheckError] = useState('');
+  // 「生成 Master Key」只在本次打开期间展示，前端不落盘——它是 worker 侧密钥，粘进 CF env 即可。
+  const [generatedMasterKey, setGeneratedMasterKey] = useState('');
+  const [generatedServerToken, setGeneratedServerToken] = useState('');
+  const [serverTokenOpen, setServerTokenOpen] = useState(false);
+
+  // 一键部署：填一枚 CF Token，剩下的（建库、传 worker、写密钥、加定时）都自动做完。
+  // Token 只在这次部署期间留在内存里，成功与否都不落盘——它是能改整个账号 Workers 的
+  // 权限，真正需要长期留着的那一份已经作为 secret 写进用户自己的 worker 了（自更新用）。
+  const [cfToken, setCfToken] = useState('');
+  const [provisioning, setProvisioning] = useState(false);
+  const [provisionStep, setProvisionStep] = useState('');
+  /** token 能用在多个账号上时让用户挑一个。 */
+  const [provisionAccounts, setProvisionAccounts] = useState<CfAccount[] | null>(null);
+  /** 全新的 CF 账号还没有 workers.dev 子域，得先起一个。 */
+  const [needsSubdomain, setNeedsSubdomain] = useState(false);
+  const [desiredSubdomain, setDesiredSubdomain] = useState('');
+  const [provisionError, setProvisionError] = useState('');
+  const [replacementNotice, setReplacementNotice] = useState('');
+  const [replacementHint, setReplacementHint] = useState<{ accountId: string; scriptName: string } | null>(null);
+  useEffect(() => {
+    if (!isOpen) return;
+    let active = true;
+    void ActiveMsgStore.getReplacementHint().then(hint => { if (active) setReplacementHint(hint); }).catch(() => {});
+    return () => { active = false; };
+  }, [isOpen]);
+  const [replacementPlan, setReplacementPlan] = useState<AmsgReplacementPlan | null>(null);
+  /** 账号里的同名库有旧数据、本机又没旧钥匙：记下是哪个账号，等用户确认清空后接着装。 */
+  const [staleDatabase, setStaleDatabase] = useState<{ accountId?: string } | null>(null);
+
+  // 补装更新能力：老办法装的后端里没有 CF_API_TOKEN，点更新会被顶回来。
+  // 粘一枚 token 就能就地补上，不用去 Cloudflare 面板。只在真的缺钥匙时才露出来。
+  const [attachOpen, setAttachOpen] = useState(false);
+  const [attachToken, setAttachToken] = useState('');
+  const [attachScriptName, setAttachScriptName] = useState('');
+  const [attachNeedsScriptName, setAttachNeedsScriptName] = useState(false);
+  const [attachAccounts, setAttachAccounts] = useState<CfAccount[] | null>(null);
+  const [attaching, setAttaching] = useState(false);
+  const [attachError, setAttachError] = useState('');
+
+  // 体检：worker 的 GET /debug 结果。它早就把「缺哪个变量、缺哪张表、缺哪几列、cron
+  // 有没有停」都算好了，但入口一直只有手拼 URL——而这几样恰恰是「界面上一切正常、
+  // 就是一条都不发」的全部原因。存原始探测结果，红绿灯在渲染时算（推送状态一变就跟着走）。
+  const [diagnosticsProbe, setDiagnosticsProbe] = useState<AmsgDiagnosticsProbe | null>(null);
+  // 定时任务的逐条细账（GET /tick-report）。/debug 只知道「几条到点没发」，为什么没发要看这份。
+  const [tickReportResult, setTickReportResult] = useState<AmsgTickReportResult | null>(null);
+  const [diagnosing, setDiagnosing] = useState(false);
+  // 体检结果放在独立分区；异步结果不切换当前标签。
+  // 标题那一行已经把结论说了，要看是哪一项才需要点开。
+
+  const [workerOutdated, setWorkerOutdated] = useState(false);
+  /**
+   * 用户那台 Worker 上的后端代码是不是最新的（见 ActiveMsgClient.probeWorkerVersion）。
+   * null = 还没探到（没填地址 / 正在探）。界面拿它决定更新按钮是高亮催更新还是弱化。
+   */
+  const [workerVersion, setWorkerVersion] = useState<AmsgWorkerVersionProbe | null>(null);
+  /** 自更新成功后 worker 报回来的代码指纹，显示出来好让人确认这次真换了。 */
+  const [selfUpdateHash, setSelfUpdateHash] = useState('');
+  /**
+   * 后台任务的定时触发（Worker 的 cron trigger）现在开着没有，见 ActiveMsgClient.getCronTriggerState。
+   * null = 这台 Worker 没有这个端点（旧版）或没读到，按钮整个不显示。
+   * token-missing = 端点在、但 Worker 没配 CF_API_TOKEN，点按钮先引导补钥匙。
+   */
+  const [cronState, setCronState] = useState<
+    { kind: 'known'; enabled: boolean } | { kind: 'token-missing'; message: string } | null
+  >(null);
+  /** 「暂停后台任务」的确认框开着没有。恢复不用确认。 */
+  const [pauseConfirmOpen, setPauseConfirmOpen] = useState(false);
+  const [relayConfirmOpen, setRelayConfirmOpen] = useState(false);
+  /** 中转令牌近 30 天的用量；null = 还没查（或没开中转、令牌格式不对）。 */
+  const [relayUsage, setRelayUsage] = useState<RelayUsageResult | null>(null);
+  useLocalBackHandler(() => { setPauseConfirmOpen(false); return true; }, 60, isOpen && !covered && pauseConfirmOpen);
+  useLocalBackHandler(() => { setRelayConfirmOpen(false); return true; }, 60, isOpen && !covered && relayConfirmOpen);
+  const backWithinSettings = () => {
+    if (provisioning || loading) return true;
+    if (existingSetup) { setExistingSetup(false); return true; }
+    if (reconfigure === 'choose') {
+      setView(reconfigureOrigin.current?.view ?? view);
+      setGuideStep(reconfigureOrigin.current?.step ?? 0);
+      setReconfigure(null); reconfigureOrigin.current = null;
+      return true;
+    }
+    if (reconfigure === 'backend' || (reconfigure === 'review' && guideStep === 1)) {
+      setReconfigure('choose'); setReplacementPlan(null);
+      return true;
+    }
+    if (view === 'guide' && guideStep > 0) {
+      if (guideStep === 1) setReplacementPlan(null);
+      setGuideStep(step => step - 1);
+      if (guideStep === 1 && config?.initializedAt && config.workerUrl?.trim()) setView('panel');
+      return true;
+    }
+    return false;
+  };
+  useLocalBackHandler(backWithinSettings, 35, isOpen && !covered && (!workspaceSection || connectionVisible));
+  useLocalBackHandler(() => true, 55, isOpen && !covered && provisioning);
+  // 这台 worker 认不认 /instant-chat。即时对话的**唯一**版本门槛就在这儿，
+  // 别处不做逐调用预检——每发一条消息多探一次网络，探失败还分不清是旧版还是网抖。
+  const [instantChatSupported, setInstantChatSupported] = useState(false);
+
+  // 特性探测：确认「过老」（端点 404 → null，或缺关键特性）才亮牌；
+  // 探测本身失败（断网 / 密钥不对 / 没填地址）不亮，避免误报。
+  const probeWorkerCaps = async (workerConfigured: boolean) => {
+    if (!workerConfigured) {
+      setWorkerOutdated(false);
+      return;
+    }
+    // 只有配了地址才报：没填地址时这次探测必然失败，那不是版本问题。
+    const shouldReport = workerConfigured && !workerCapsReported;
+    if (shouldReport) workerCapsReported = true;
+    try {
+      const caps = await ActiveMsgClient.getCapabilities();
+      const missingFeature = !caps || REQUIRED_WORKER_FEATURES.some((f) => !caps.features.includes(f));
+      const versionTooOld = !caps || !isAmsgServerVersionAtLeast(caps.serverVersion, REQUIRED_WORKER_VERSION);
+      setWorkerOutdated(missingFeature || versionTooOld);
+      // 跑着旧 worker 的表现是**静默错**（自述回写不落盘、任务重复推），用户不会来报，
+      // 面板这一句提示是唯一的出口。这里数的就是「有多少人正跑着一个不该跑的版本」。
+      if (shouldReport) {
+        trackEvent('探测 2.0 Worker 能力', {
+          result: !caps ? '端点不存在' : missingFeature ? '缺特性' : versionTooOld ? '版本过旧' : 'ok',
+        });
+      }
+    } catch {
+      setWorkerOutdated(false);
+      // 探测本身炸了（断网 / 地址不通）不亮牌，免得误报；但它跟「版本旧」是两回事，
+      // 单独占一格，看分布时能一眼把这批人排除掉。
+      if (shouldReport) trackEvent('探测 2.0 Worker 能力', { result: '探测失败' });
+    }
+  };
+
+  // 已经存过盘的那个 Worker 地址与共享密钥。清空确认要用地址；两个一起记下可避免打开弹窗时无改动空写库。
+  const savedWorkerUrlRef = useRef('');
+  const savedServerTokenRef = useRef('');
+
+  /**
+   * 拉一次体检。没填地址时不拉——那时候唯一该做的事是把地址填上，
+   * 摆一排红灯只会让人以为哪儿坏了。
+   */
+  const runDiagnostics = async () => {
+    setDiagnosing(true);
+    try {
+      // 两个端点互不依赖，并排拉；细账那边失败不抛，不会拖垮体检本身。
+      const [probe, tickReport] = await Promise.all([fetchWorkerDiagnostics(), fetchWorkerTickReport()]);
+      setDiagnosticsProbe(probe);
+      setTickReportResult(tickReport);
+    } finally {
+      setDiagnosing(false);
+    }
+  };
+
+  /** 把 worker 报回来的定时触发状态翻成界面上的三态（见 cronState 的说明）。 */
+  const applyCronTriggerState = (state: AmsgCronTriggerState | null) => {
+    if (!state) {
+      setCronState(null);
+      return;
+    }
+    if (state.supported && typeof state.enabled === 'boolean') {
+      setCronState({ kind: 'known', enabled: state.enabled });
+      return;
+    }
+    if (state.code === 'CF_TOKEN_MISSING') {
+      setCronState({ kind: 'token-missing', message: state.message || '' });
+      return;
+    }
+    // 别的原因（认不出 Worker 名、CF 那边读不到）：按钮不显示，原因留在 console 里备查。
+    if (state.message) console.warn('[amsg2] 读不到后台任务的定时触发状态：', state.message);
+    setCronState(null);
+  };
+
+  /**
+   * 报一次「即时对话此刻能不能开、开不了卡在哪」。
+   *
+   * 这一格只能在这儿收：开关灰着的时候用户什么都点不动，也就不会产生任何别的事件——
+   * 光看配置快照里那个开/关，被挡在门外的人和「不想要这功能的人」长得一模一样。
+   * 判定跟界面上那行黄字共用 resolveInstantChatBlocker，两处不会各说各话。
+   */
+  const reportInstantChatGate = (gate: InstantChatGateInput, enabled: boolean) => {
+    if (instantChatGateReported) return;
+    instantChatGateReported = true;
+    trackEvent('即时对话能不能开', {
+      result: resolveInstantChatBlocker(gate) ?? '可以开',
+      // 已经开着的人也报：他们卡住意味着「开的时候好好的，后来 Worker 退回旧版了」，
+      // 那是一种发一条挂一条、但设置页还写着「已开启」的坏法。
+      state: enabled ? '已开着' : '还没开',
+    });
+  };
+
+  const refreshPushStatus = async (nextConfig: ActiveMsg2GlobalConfig) => {
+    const requestId = ++pushRequestIdRef.current;
+    setCheckingPush(true);
+    setPushCheckError('');
+    setPushStatus(null);
+    try {
+      const nextPushStatus = await waitForSettingsCheck(ActiveMsgClient.getPushStatus());
+      if (requestId !== pushRequestIdRef.current) return;
+      setPushStatus(nextPushStatus);
+      if (isAmsg2WorkerActive(nextConfig)) {
+        void ActiveMsgClient.probeInstantChatSupport().then((supported) => {
+          if (requestId !== pushRequestIdRef.current) return;
+          setInstantChatSupported(supported);
+          reportInstantChatGate({
+            connected: Boolean(nextConfig.initializedAt),
+            pushSubscribed: Boolean(nextPushStatus.hasSubscription),
+            workerSupportsInstantChat: supported,
+          }, isInstantChatSwitchedOn(nextConfig));
+        }).catch(() => {
+          if (requestId === pushRequestIdRef.current) setInstantChatSupported(false);
+        });
+      }
+    } catch (error) {
+      if (requestId !== pushRequestIdRef.current) return;
+      setPushCheckError(error instanceof Error && error.name === 'TimeoutError'
+        ? '推送状态检查超时，可以重试；其他配置仍可正常修改。'
+        : '推送状态读取失败，可以重试；其他配置仍可正常修改。');
+    } finally {
+      if (requestId === pushRequestIdRef.current) setCheckingPush(false);
+    }
+  };
+
+  const refresh = async () => {
+    const requestId = ++configRequestIdRef.current;
+    ++pushRequestIdRef.current;
+    setConfigLoadError('');
+    let nextConfig: ActiveMsg2GlobalConfig;
+    try {
+      nextConfig = await waitForSettingsCheck(ActiveMsgClient.getGlobalConfig());
+    } catch (error) {
+      if (requestId !== configRequestIdRef.current) return;
+      setConfigLoadError(error instanceof Error && error.name === 'TimeoutError'
+        ? '本地配置读取超时，请重试。'
+        : '本地配置读取失败，请重试。');
+      throw error;
+    }
+    if (requestId !== configRequestIdRef.current) return;
+    savedWorkerUrlRef.current = nextConfig.workerUrl || '';
+    savedServerTokenRef.current = nextConfig.serverToken || '';
+    // 先交出表单，推送就绪与否只影响推送区域，不挡住整个面板。
+    setConfig(nextConfig);
+    setView((prev) => prev ?? (nextConfig.initializedAt && nextConfig.workerUrl?.trim() ? 'panel' : 'guide'));
+    void refreshPushStatus(nextConfig);
+    const workerActive = isAmsg2WorkerActive(nextConfig);
+    if (workerActive) {
+      void probeWorkerCaps(true);
+      void ActiveMsgClient.probeWorkerVersion().then(setWorkerVersion);
+      void runDiagnostics();
+      // 已连接才问定时触发开没开：没连上的时候这事还轮不到操心。
+      if (nextConfig.initializedAt) void ActiveMsgClient.getCronTriggerState().then(applyCronTriggerState);
+      else setCronState(null);
+    } else {
+      setWorkerOutdated(false);
+      setInstantChatSupported(Boolean(nextConfig.instantChatSupported));
+      setDiagnosticsProbe(null);
+      setTickReportResult(null);
+      setWorkerVersion(null);
+      setCronState(null);
+    }
+  };
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setConfig(null);
+    setPushStatus(null);
+    setInstantChatSupported(false);
+    setView(null);
+    setGuideStep(0);
+    setPanelTab('worker');
+    setManualSetupOpen(false);
+    // 两个明文密钥都要清：留到下次打开面板还挂在页面上，就是白白多摊一次。
+    setGeneratedMasterKey('');
+    setGeneratedServerToken('');
+    // CF Token 更要清：它比上面两个都重，绝不留到下次打开。
+    setCfToken('');
+    setDiscoveryRequest(null);
+    setExistingSetup(false);
+    setReconfigure(null); reconfigureOrigin.current = null; setVerifiedConnection(null);
+    setReplacementPlan(null);
+    setReplacementNotice('');
+    setProvisionAccounts(null);
+    setNeedsSubdomain(false);
+    setDesiredSubdomain('');
+    setProvisionError('');
+    setAttachOpen(false);
+    setAttachToken('');
+    setAttachScriptName('');
+    setAttachNeedsScriptName(false);
+    setAttachAccounts(null);
+    setAttachError('');
+    setPauseConfirmOpen(false);
+    // refresh 已把读取错误放进面板；操作按钮仍可用它的 rejection 显示操作失败。
+    void refresh().catch(() => {});
+    return () => {
+      ++configRequestIdRef.current;
+      ++pushRequestIdRef.current;
+    };
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (isOpen && !covered && workspaceSection === 'push' && config) void refreshPushStatus(config);
+    // Re-entering the device page rechecks permissions without saving or registering a subscription.
+  }, [workspaceSection, covered]);
+
+  /**
+   * 地址被清空时的收尾：把「那边还留着东西」说清楚，把旧地址记一笔，**不动云端数据**。
+   *
+   * 早先这里会顺手把远端任务全取消掉，理由是「地址一清，回复推回来这边也接不住」。
+   * 但清空地址本身没有毁灭的意味：用户可能只是要换个反代端点、换个自定义域名，背后
+   * 还是同一台 worker、同一个 D1，照着「地址变了」就去销毁任务，等于把人家排好的东西
+   * 删了。真想清有专门的入口——「清空云端数据」是用户亲手点的，那里才该动手。
+   *
+   * 代价得说在明处：光存空值的话，前端这边所有同步立刻停摆，D1 里的任务却一条没少，
+   * cron 每分钟照常消费、照烧 LLM、照推送，只是内容永远停在最后一次同步的样子。所以
+   * 这句提示必须把「任务不会被取消」写明白，并且把旧地址记进备忘——地址一清，本地就
+   * 再没有别的地方记得它，用户想回去清都找不到门。
+   */
+  const confirmDetachWorker = async (previousUrl: string): Promise<boolean> => {
+    const ok = confirm(`清空 Worker 地址之后，那台 Worker 上已经排好的定时任务不会被取消——它们仍会按时触发、照常推送，只是这边管不到了。\n\n地址：${previousUrl}\n\n想连任务一起停掉的话，请先用下面「高级信息」里的「清空云端数据」清一遍，再回来清空地址。\n\n仍然清空吗？`);
+    if (!ok) return false;
+    rememberDetachedWorker(previousUrl);
+    addToast('地址已清空，云端那份没动。想清的话把地址填回来，用「清空云端数据」清一遍。', 'info');
+    return true;
+  };
+
+  const persistGlobalConfig = async () => {
+    if (!config) return;
+    const previousUrl = savedWorkerUrlRef.current;
+    const nextUrl = config.workerUrl || '';
+    if (isWorkerUrlCleared(previousUrl, nextUrl)) {
+      if (!await confirmDetachWorker(previousUrl)) {
+        // 用户反悔：把地址填回输入框，别留一个「界面空着、库里还存着」的错位。
+        patchConfig({ workerUrl: savedWorkerUrlRef.current });
+        return;
+      }
+    } else if (previousUrl && nextUrl && previousUrl !== nextUrl) {
+      // 换地址：多半只是换了个入口（反代端点、自定义域名），背后还是同一台 worker，
+      // 所以一个字节都不动，只把旧地址记一笔——万一真是换了后端，用户还有地方找回去。
+      rememberDetachedWorker(previousUrl);
+    }
+    await ActiveMsgStore.saveGlobalConfig({
+      workerUrl: config.workerUrl,
+      serverToken: config.serverToken,
+      instantChatEnabled: config.instantChatEnabled,
+      pushMode: config.pushMode,
+      thirdPartyPush: config.thirdPartyPush,
+      // 一键部署生成的 Master Key 也要跟着存：这是本地唯一的一份，Worker 那边读不回来。
+      masterKey: config.masterKey,
+    });
+    savedWorkerUrlRef.current = config.workerUrl || '';
+    savedServerTokenRef.current = config.serverToken || '';
+  };
+
+  useEffect(() => {
+    if (!isOpen || !config) return;
+    if (
+      (config.workerUrl || '') === savedWorkerUrlRef.current
+      && (config.serverToken || '') === savedServerTokenRef.current
+    ) {
+      return;
+    }
+    const timer = setTimeout(() => { void persistGlobalConfig(); }, 1000);
+    return () => clearTimeout(timer);
+  }, [config?.workerUrl, config?.serverToken, isOpen]);
+
+  const patchConfig = (updates: Partial<ActiveMsg2GlobalConfig>) => {
+    setConfig((prev) => ({
+      ...(prev || { userId: '', workerUrl: '' }),
+      ...updates,
+    }));
+  };
+
+  // 立刻存盘，不等「连接」：一键部署后等 Worker 生效、连接建表，都按存盘的配置发请求
+  const saveRelay = async (next: boolean) => {
+    patchConfig({ useRelay: next });
+    await ActiveMsgStore.saveGlobalConfig({ useRelay: next });
+  };
+
+  const saveRelayToken = async (value: string) => {
+    const relayToken = value.trim();
+    patchConfig({ relayToken });
+    await ActiveMsgStore.saveGlobalConfig({ relayToken });
+  };
+
+  // 打开面板、令牌变了各查一次用量，不轮询；稍等一下再查，免得边粘贴边发请求
+  // 非官方渠道不能用官方中转；判定前（checking）也先当不能用，免得开关闪一下可点
+  const [relayDeployment, setRelayDeployment] = useState<'checking' | 'official' | 'other'>('checking');
+  useEffect(() => {
+    let cancelled = false;
+    void getRelayDeploymentSource().then((source) => {
+      if (!cancelled) setRelayDeployment(source === 'official' ? 'official' : 'other');
+    });
+    return () => { cancelled = true; };
+  }, []);
+  const relayAllowed = relayDeployment === 'official';
+  const relayTokenReady = relayAllowed && !!config?.useRelay && isRelayTokenWellFormed(config?.relayToken);
+  useEffect(() => {
+    setRelayUsage(null);
+    if (!isOpen || !relayTokenReady || !config?.relayToken || !isAmsg2GloballyEnabled(config)) return;
+    let cancelled = false;
+    const relayToken = config.relayToken;
+    const timer = setTimeout(() => {
+      void fetchRelayUsage(relayToken).then((result) => { if (!cancelled) setRelayUsage(result); });
+    }, 600);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [isOpen, relayTokenReady, config?.relayToken, config?.enabled]);
+
+  // 打开要先过数据边界的提醒；关掉直接生效
+  const handleToggleRelay = (next: boolean) => {
+    if (next) setRelayConfirmOpen(true);
+    else void saveRelay(false);
+  };
+
+  const handleSwitchPushMode = async (nextMode: 'web-push' | 'third-party') => {
+    if (!config) return;
+    setShowNtfyInfo(false);
+    const nextThirdParty = config.thirdPartyPush || { provider: 'wxpusher' as const, token: '' };
+    patchConfig({ pushMode: nextMode, thirdPartyPush: nextThirdParty });
+    await ActiveMsgStore.saveGlobalConfig({
+      instantChatEnabled: config.instantChatEnabled,
+      pushMode: nextMode,
+      thirdPartyPush: nextThirdParty,
+    });
+    if (nextMode === 'web-push' && config.initializedAt) {
+      void ActiveMsgClient.reconcilePushSubscription().catch(() => {});
+    }
+    await refreshPushStatus({ ...config, pushMode: nextMode, thirdPartyPush: nextThirdParty });
+  };
+
+  const handleSelectThirdPartyProvider = async (nextProvider: ThirdPartyPushProvider) => {
+    if (!config) return;
+    setShowNtfyInfo(false);
+    const prevTp = config.thirdPartyPush || { provider: 'wxpusher' as const, token: '' };
+    const nextThirdParty = {
+      ...prevTp,
+      provider: nextProvider,
+    };
+    patchConfig({ pushMode: 'third-party', thirdPartyPush: nextThirdParty });
+    await ActiveMsgStore.saveGlobalConfig({
+      instantChatEnabled: config.instantChatEnabled,
+      pushMode: 'third-party',
+      thirdPartyPush: nextThirdParty,
+    });
+    await refreshPushStatus({ ...config, pushMode: 'third-party', thirdPartyPush: nextThirdParty });
+  };
+
+  const handleSaveThirdPartyPush = async () => {
+    if (!config) return;
+    const tp = config.thirdPartyPush || { provider: 'wxpusher' as const, token: '' };
+    const validation = validateThirdPartyPushConfig(tp);
+    if (!validation.ok) {
+      addToast(validation.error || '请填写有效的第三方推送配置。', 'error');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      await ActiveMsgStore.saveGlobalConfig({
+        instantChatEnabled: config.instantChatEnabled,
+        pushMode: 'third-party',
+        thirdPartyPush: tp,
+      });
+      if (isAmsg2WorkerActive(config)) {
+        await ActiveMsgClient.registerPushSubscription();
+        await refresh();
+        addToast('第三方推送通道已保存并登记到 Worker。', 'success');
+      } else {
+        await refreshPushStatus({ ...config, pushMode: 'third-party', thirdPartyPush: tp });
+        addToast(
+          config.workerUrl?.trim()
+            ? '第三方推送配置已保存，恢复总开关后会自动登记到 Worker。'
+            : '第三方推送配置已保存，连接 Worker 后会自动登记。',
+          'success',
+        );
+      }
+      trackEvent('开启通知与推送订阅', { result: 'ok' });
+    } catch (error: any) {
+      addToast(error?.message || '登记第三方推送失败。', 'error');
+      trackEvent('开启通知与推送订阅', { result: readAmsgFailKind(error) });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSendTestPush = async () => {
+    setLoading(true);
+    setTestPushResult('sending');
+    try {
+      await ActiveMsgClient.sendTestPush();
+      setTestPushResult('sent');
+      addToast('测试通知已发出，请看手机通知栏是否收到！', 'success');
+    } catch (error: any) {
+      setTestPushResult('failed');
+      addToast(error?.message || '发送测试通知失败。', 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCreateSubscription = async () => {
+    setLoading(true);
+    try {
+      // 建完浏览器订阅还要登记到 worker 上那一份用户级订阅——worker 到点读的是它，
+      // 只在浏览器建订阅的话云端仍是空的，到点会抛 PUSH_SUBSCRIPTION_MISSING，
+      // 而这句 toast 已经报了「准备完成」。
+      await ActiveMsgClient.registerPushSubscription();
+      await refresh();
+      addToast('通知权限和推送订阅已准备完成。', 'success');
+      trackEvent('开启通知与推送订阅', { result: 'ok' });
+    } catch (error: any) {
+      addToast(error?.message || '创建推送订阅失败。', 'error');
+      // 只报抛错那一刻挂上的代号（源码里写死的枚举）。错误原文可能带 push endpoint，
+      // 留在 toast 和 console 里，不进上报。
+      trackEvent('开启通知与推送订阅', { result: readAmsgFailKind(error) });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /**
+   * 一键部署：只要一枚 Cloudflare API Token，把后端从零装好，装完顺手连上。
+   *
+   * 密钥全部在本地生成，用户不用复制粘贴任何东西。已经有的一律沿用——Master Key 换了
+   * 之前排的任务全解不开，VAPID 换了浏览器现有的推送订阅会全部 403。
+   *
+   * Token 只在这次操作期间留在内存里，成功与否都不落盘。需要长期留着的那一份已经作为
+   * secret 写进用户自己的 Worker 了（以后「更新后端」用的就是它）。
+   */
+  const handleOneClickDeploy = async (accountId?: string, resetExistingDatabase = false, replacement = replacementPlan, tokenInput = cfToken) => {
+    const token = tokenInput.trim();
+    if (!token) {
+      addToast('先把 Cloudflare API Token 填进来。', 'error');
+      return;
+    }
+
+    setProvisioning(true);
+    setProvisionError('');
+    if (!replacement) setReplacementNotice('');
+    setProvisionStep('');
+    setStaleDatabase(null);
+    try {
+      const vapid = loadPushVapid();
+      const result = await provisionAmsgBackend({
+        token,
+        accountId: replacement?.accountId || accountId || undefined,
+        scriptName: replacement?.scriptName,
+        replacement: replacement || undefined,
+        desiredSubdomain: desiredSubdomain.trim() || undefined,
+        secrets: {
+          AMSG_MASTER_KEY: config?.masterKey || undefined,
+          VAPID_PUBLIC_KEY: vapid.vapidPublicKey || undefined,
+          VAPID_PRIVATE_KEY: vapid.vapidPrivateKey || undefined,
+          VAPID_EMAIL: vapid.vapidEmail || undefined,
+          AMSG_SERVER_TOKEN: config?.serverToken || undefined,
+        },
+        resetExistingDatabase,
+        onProgress: (p: ProvisionProgress) => setProvisionStep(p.message),
+      });
+
+      if (!result.ok) {
+        setProvisionStep('');
+        if (result.code === 'REPLACEMENT_COMPLETED_ELSEWHERE') {
+          setReplacementPlan(null); setReconfigure(null);
+          setDiscoveryRequest({ token, scriptName: replacement?.scriptName || AMSG_SCRIPT_NAME });
+          setCfToken(''); setExistingSetup(true); setFeatureTab('connection');
+          onSelectWorkspace?.('config'); addToast(result.message, 'info');
+          return;
+        }
+        if (result.code === 'REPLACEMENT_DRAINING') {
+          setReplacementNotice(result.message);
+          await ActiveMsgStore.saveGlobalConfig({ initializedAt: undefined });
+          patchConfig({ initializedAt: undefined });
+          return;
+        }
+        // 这两种不是失败，是「还差一个信息」，界面上补个输入再点一次就能接着走。
+        if (result.code === 'ACCOUNT_AMBIGUOUS') {
+          setProvisionAccounts(result.accounts || []);
+          trackEvent('一键部署 2.0 后端', { result: '要选账号' });
+          return;
+        }
+        if (result.code === 'SUBDOMAIN_MISSING') {
+          setNeedsSubdomain(true);
+          setProvisionError(result.message);
+          trackEvent('一键部署 2.0 后端', { result: '要起子域名' });
+          return;
+        }
+        if (result.code === 'DATABASE_KEY_MISSING') {
+          setStaleDatabase({ accountId });
+          setProvisionError(result.message);
+          trackEvent('一键部署 2.0 后端', { result: '旧库缺密钥' });
+          return;
+        }
+        if (result.code === 'SCRIPT_EXISTS' && workspaceSection) {
+          setDiscoveryRequest({ token, scriptName: AMSG_SCRIPT_NAME });
+          setCfToken(''); setProvisionAccounts(null);
+          setExistingSetup(true); setFeatureTab('connection');
+          onSelectWorkspace?.('config');
+        } else {
+          setProvisionError(result.message);
+        }
+        trackEvent('一键部署 2.0 后端', { result: '失败' });
+        return;
+      }
+
+      const wasDisabled = !isAmsg2GloballyEnabled(config);
+      // 先把密钥落盘（保留当前总开关状态，等 connect 握手成功后再切为开启），防止等待超时或建表失败时提前误置为已开启。
+      const { secrets } = result;
+      savePushVapid({
+        vapidPublicKey: secrets.VAPID_PUBLIC_KEY,
+        vapidPrivateKey: secrets.VAPID_PRIVATE_KEY,
+        vapidEmail: secrets.VAPID_EMAIL || undefined,
+      });
+      // instantChatEnabled 跟着一起写：面板渲染时 config 一定不是 null（文件末尾有空值
+      // 早退），读到的就是界面上当前的值，不显式带上会被这次保存冲掉。
+      await ActiveMsgStore.saveGlobalConfig({
+        enabled: config?.enabled,
+        workerUrl: result.workerUrl,
+        serverToken: secrets.AMSG_SERVER_TOKEN,
+        masterKey: secrets.AMSG_MASTER_KEY,
+        ...(replacement ? { initializedAt: undefined } : {}),
+        instantChatEnabled: config?.instantChatEnabled,
+        pushMode: config?.pushMode,
+        thirdPartyPush: config?.thirdPartyPush,
+      });
+      patchConfig({
+        workerUrl: result.workerUrl,
+        serverToken: secrets.AMSG_SERVER_TOKEN,
+        masterKey: secrets.AMSG_MASTER_KEY,
+        ...(replacement ? { initializedAt: undefined } : {}),
+      });
+      savedWorkerUrlRef.current = result.workerUrl;
+      savedServerTokenRef.current = secrets.AMSG_SERVER_TOKEN || '';
+      // The new credentials now live in the normal connection store. A separate
+      // checkpoint is only needed while cloud replacement is still in progress.
+      if (replacement) { await ActiveMsgStore.saveReplacementPlan(replacement.accountId, replacement.scriptName, null); setReplacementHint(null); }
+
+      setProvisionAccounts(null);
+      setNeedsSubdomain(false);
+      setCfToken('');
+      setReplacementPlan(null);
+      setReplacementNotice('');
+      result.warnings.forEach((warning) => addToast(warning, 'info'));
+      // 别在这儿说「装好了」就完事：地址还要几十秒才在各个边缘节点上生效，而上面那句
+      // patchConfig 一落地，一键部署那张卡片就因为「地址已填」收起来了——进度条跟着消失，
+      // 看上去像是全部办妥。用户于是去点「连接并启用」，撞上还没生效的地址。
+      addToast(`后端装好了：${result.workerUrl}。地址还要几十秒才生效，等它自己连上就行。`, 'success');
+      trackEvent('一键部署 2.0 后端', { result: '成功' });
+
+      // 刚建好的 workers.dev 地址要等一会儿才解析得到，等它活过来再建表。
+      setProvisionStep('等待 Worker 启动…');
+      const ready = await waitForWorkerReady(resolveWorkerFetchBase(result.workerUrl, config?.useRelay, config?.relayToken));
+      if (!ready) {
+        addToast('Worker 装好了，但地址还没生效。过一两分钟点一下「连接并启用」即可。', 'info');
+        return;
+      }
+      setProvisionStep('正在建表…');
+      const { warnings } = await ActiveMsgClient.connect();
+      if (wasDisabled) onReenabledAfterConnect?.();
+      await refresh();
+      setVerifiedConnection({ workerUrl: result.workerUrl, serverToken: secrets.AMSG_SERVER_TOKEN || '' });
+      warnings.forEach((warning) => addToast(warning.message, 'info'));
+      addToast('已连接成功，主动消息 2.0 可以用了。', 'success');
+    } catch (error: any) {
+      // 报错原文只进界面，不进上报（可能带地址、账号 id）。
+      setProvisionError(error?.message || '部署过程中出错了。');
+      trackEvent('一键部署 2.0 后端', { result: '失败' });
+    } finally {
+      setProvisioning(false);
+      setProvisionStep('');
+    }
+  };
+
+  const handleRedeploy = async (token: string, backend: ExistingAmsgBackend) => {
+    setProvisioning(true);
+    try {
+      const plan = await createAmsgReplacementPlan(backend);
+      setReplacementHint({ accountId: plan.accountId, scriptName: plan.scriptName });
+      if (!reconfigureOrigin.current) reconfigureOrigin.current = { view, step: guideStep };
+      setReconfigure('review'); setVerifiedConnection(null);
+      setReplacementPlan(plan); setCfToken(token); setExistingSetup(false);
+      setView('guide'); setGuideStep(1); setFeatureTab('connection');
+      onSelectWorkspace?.('config');
+      await handleOneClickDeploy(plan.accountId, false, plan, token);
+    } finally { setProvisioning(false); }
+  };
+
+  const handleConnect = async () => {
+    if (!config?.workerUrl.trim()) {
+      addToast('先把你部署的 Worker 地址填进来。', 'error');
+      return;
+    }
+
+    setLoading(true); setVerifiedConnection(null);
+    try {
+      const wasDisabled = !isAmsg2GloballyEnabled(config);
+      await ActiveMsgStore.saveGlobalConfig({
+        workerUrl: config.workerUrl,
+        serverToken: config.serverToken,
+        instantChatEnabled: config.instantChatEnabled,
+        pushMode: config.pushMode,
+        thirdPartyPush: config.thirdPartyPush,
+      });
+      savedWorkerUrlRef.current = config.workerUrl || '';
+      savedServerTokenRef.current = config.serverToken || '';
+      const { warnings } = await ActiveMsgClient.connect();
+      if (wasDisabled) onReenabledAfterConnect?.();
+      await refresh();
+      setVerifiedConnection({ workerUrl: config.workerUrl, serverToken: config.serverToken || '' });
+      addToast('已连接成功，主动消息 2.0 可以用了。', 'success');
+      // 连上了但有一块是哑的（最典型是 VAPID 没配齐：任务建得成、到点一条都推不出去，
+      // 而界面上没有任何异常）。这类问题用户自己发现不了，连接这一刻不说就没人说了。
+      warnings.forEach((warning) => addToast(warning.message, 'info'));
+      // 只报「这次连接成没成 / 卡在哪一类」。连接串 / tenantToken / 错误原文一概不带，
+      // 也不报「之前配没配过 tenant」——那等于把两项凭据的配置状态压成一位发出去。
+      // 失败代号是抛错时按 HTTP 状态挂上的字面量（见 activeMsgClient 的 AmsgFailKind），
+      // 分开是因为「密钥对不上」和「D1 没绑」要用户去改的地方完全不同。
+      trackEvent('连接并启用主动消息 2.0', { result: 'ok' });
+    } catch (error: any) {
+      addToast(error?.message || '连接失败。', 'error');
+      trackEvent('连接并启用主动消息 2.0', { result: readAmsgFailKind(error) });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleRestoreConnection = async (connection: AmsgConnection) => {
+    const wasDisabled = !isAmsg2GloballyEnabled(config);
+    if (savedWorkerUrlRef.current && savedWorkerUrlRef.current !== connection.workerUrl) rememberDetachedWorker(savedWorkerUrlRef.current);
+    const restored = { ...config, ...connection, initializedAt: undefined, instantChatSupported: undefined, workerBundleVersion: undefined, anthropicMessagesSupported: undefined, anthropicMessagesWorkerUrl: undefined };
+    await ActiveMsgStore.saveGlobalConfig(restored);
+    savedWorkerUrlRef.current = connection.workerUrl;
+    savedServerTokenRef.current = connection.serverToken || '';
+    setConfig(restored);
+    // Only this explicit action registers this device; preview/discovery never changes a subscription.
+    const { warnings } = await ActiveMsgClient.connect();
+    if (wasDisabled) onReenabledAfterConnect?.();
+    warnings.forEach(warning => addToast(warning.message, 'info'));
+    await refresh();
+    setExistingSetup(false);
+    if (reconfigure === 'review') {
+      setVerifiedConnection({ workerUrl: connection.workerUrl, serverToken: connection.serverToken || '' });
+      setGuideStep(2); setView('guide');
+    } else setView('panel');
+  };
+
+  /**
+   * 让后端自己更新到最新版本。
+   *
+   * 三种装法（fork 后连 Git / Deploy 按钮 / 找人代配）此前更新方式各不相同，最麻烦的一种
+   * 要在两个网站之间倒腾一个几百 KB 的文件。有了这个按钮都变成点一下。
+   *
+   * 更新成功后接着跑一次「连接并验证」（POST /init-tenant，幂等）。
+   *
+   * 这一步不是可有可无的收尾：新版后端可能带了新的表结构，而 D1 的建表只在这个端点里做。
+   * 少了它，Worker 代码是新的、库还是旧的，cron 每分钟静默失败，主动消息整个停摆——
+   * 而界面上一切正常，用户完全看不出来（这个坑踩过）。让「更新」自己把它带上，
+   * 就不必指望每个人都记得再手动点一次。
+   *
+   * 失败不改判这次更新：代码确实已经换上了，只是库没跟上。分开报，用户才知道该点哪个。
+   */
+  /** 自动更新近况那一行；没能力（没钥匙）时是 null。 */
+  const autoUpdateText = describeAmsgSelfUpdate(workerVersion?.autoUpdate ?? null);
+
+  const handleSelfUpdateWorker = async () => {
+    setLoading(true);
+    try {
+      const result = await ActiveMsgClient.selfUpdateWorker();
+      if (result.ok) {
+        setSelfUpdateHash(result.bundleHash || '');
+        setAttachOpen(false);
+        addToast(result.message, 'success');
+        try {
+          await ActiveMsgClient.connect();
+          await refresh();
+        } catch (error: any) {
+          addToast(
+            `后端已更新，但紧接着的验证没过：${error?.message || '未知原因'}。手动点一下「重新连接并验证」。`,
+            'error',
+          );
+        }
+      } else {
+        addToast(result.message, result.supported ? 'error' : 'info');
+        // 「缺 CF_API_TOKEN」是这里唯一能就地解决的一种：露出补装那一块，
+        // 用户粘一枚 token 就好，不用去 Cloudflare 面板加变量。
+        if (result.code === 'CF_TOKEN_MISSING') setAttachOpen(true);
+      }
+      trackEvent('更新后端 Worker', {
+        result: result.ok ? 'ok' : result.supported ? 'failed' : 'unsupported',
+      });
+    } catch (error: any) {
+      addToast(error?.message || '更新失败。', 'error');
+      trackEvent('更新后端 Worker', { result: 'failed' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /**
+   * 暂停 / 恢复后台任务：让 Worker 摘掉或加回自己的 cron trigger（见 worker/amsg/src/cronTrigger.ts）。
+   *
+   * 暂停期间到点的任务在 D1 里排着，不会丢；恢复后的第一跳一起补发。
+   * 走 GitHub 的 Sync fork 重新部署会按 wrangler.toml 把 cron 加回来，所以这不是永久开关。
+   */
+  const applyCronTrigger = async (enabled: boolean) => {
+    setPauseConfirmOpen(false);
+    setLoading(true);
+    const action = enabled ? 'resume' : 'pause';
+    try {
+      const result = await ActiveMsgClient.setCronTriggerEnabled(enabled);
+      if (result.ok) {
+        setCronState({ kind: 'known', enabled });
+        addToast(result.message, 'success');
+      } else {
+        addToast(result.message, 'error');
+        // 缺 CF_API_TOKEN 是这里唯一能就地解决的一种，跟自更新一样露出补钥匙那一块。
+        if (result.code === 'CF_TOKEN_MISSING') setAttachOpen(true);
+      }
+      trackEvent('暂停后台任务', { action, result: result.ok ? 'ok' : 'failed' });
+    } catch (error: any) {
+      addToast(error?.message || (enabled ? '恢复失败。' : '暂停失败。'), 'error');
+      trackEvent('暂停后台任务', { action, result: 'failed' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /** 暂停要先确认（点错一下角色就全哑了），恢复直接做。 */
+  const handleCronTriggerClick = () => {
+    if (!cronState) return;
+    if (cronState.kind === 'token-missing') {
+      // 钥匙还没装，先把补装那一块露出来；装好之后再点就能真的暂停了。
+      addToast(cronState.message || '这台 Worker 还没配 CF_API_TOKEN，先在下面补一把钥匙。', 'info');
+      setAttachOpen(true);
+      return;
+    }
+    if (cronState.enabled) setPauseConfirmOpen(true);
+    else void applyCronTrigger(true);
+  };
+
+  /**
+   * 给已经装好的后端补上「自己更新自己」的钥匙。
+   *
+   * 只写 CF_API_TOKEN / CF_SCRIPT_NAME 两条密钥，不碰脚本也不碰别的绑定——手动部署的
+   * 用户，前端手里根本没有他们的 Master Key，走重传那条路会把密钥抹掉。
+   */
+  const handleAttachUpdateKey = async (accountId?: string) => {
+    const token = attachToken.trim();
+    if (!token) {
+      addToast('先把 Cloudflare API Token 填进来。', 'error');
+      return;
+    }
+    if (!config?.workerUrl.trim()) {
+      addToast('先把 Worker 地址填好。', 'error');
+      return;
+    }
+
+    setAttaching(true);
+    setAttachError('');
+    try {
+      const result = await attachUpdateCapability({
+        token,
+        workerUrl: config.workerUrl,
+        scriptName: attachScriptName.trim() || undefined,
+        accountId,
+      });
+
+      if (!result.ok) {
+        if (result.code === 'SCRIPT_NAME_UNKNOWN') {
+          setAttachNeedsScriptName(true);
+          setAttachError(result.message);
+          trackEvent('补装后端更新能力', { result: '要填Worker名' });
+          return;
+        }
+        if (result.code === 'ACCOUNT_AMBIGUOUS') {
+          setAttachAccounts(result.accounts || []);
+          trackEvent('补装后端更新能力', { result: '要选账号' });
+          return;
+        }
+        setAttachError(result.message);
+        trackEvent('补装后端更新能力', { result: '失败' });
+        return;
+      }
+
+      setAttachToken('');
+      setAttachAccounts(null);
+      setAttachNeedsScriptName(false);
+      addToast('钥匙装好了，现在可以点上面的「更新 Worker」了。', 'success');
+      trackEvent('补装后端更新能力', { result: '成功' });
+      // 钥匙一到位，暂停后台任务那个按钮也能用了，重新问一次它的状态。
+      void ActiveMsgClient.getCronTriggerState().then(applyCronTriggerState);
+    } catch (error: any) {
+      setAttachError(error?.message || '装钥匙时出错了。');
+      trackEvent('补装后端更新能力', { result: '失败' });
+    } finally {
+      setAttaching(false);
+    }
+  };
+
+  // 手动配置用：把打包好的 Worker 代码复制出来，贴进 CF 后台的 Edit code。
+  const handleCopyWorkerBundle = async () => {
+    try {
+      await ActiveMsgClient.copyWorkerBundleToClipboard();
+      addToast('Worker 代码已复制，去 CF 后台的 Edit code 里粘贴覆盖。', 'success');
+      trackEvent('复制 2.0 Worker 代码', { result: 'ok' });
+    } catch (error: any) {
+      addToast(`复制失败（${error?.message || error}）。也可以从仓库 worker/amsg/worker.bundle.js 获取。`, 'error');
+      // 剪贴板 API 在非 HTTPS / 部分 WebView 里会直接抛，这条就是那批人的规模。
+      trackEvent('复制 2.0 Worker 代码', { result: 'failed' });
+    }
+  };
+
+  /**
+   * 复制密钥时带不带 `变量名=` 前缀，看 Worker 地址填了没：
+   * 空着 = 还没装后端，用户要去 Cloudflare 的 Variables and secrets 里新建变量，
+   * 给整行最省事（粘一行进去会自动拆成名字和值两栏，不用对着抄名字）；
+   * 填了 = 后端早装好了，这会儿是回来改某一项的值，光标就停在值那一栏，
+   * 整行粘进去会把变量名一起写成值。
+   */
+  const copyWholeEnvLine = !config?.workerUrl?.trim();
+
+  /**
+   * 把刚生成的密钥交给用户：存进 state 供展示 + 尽量复制到剪贴板。
+   * 输入框是 password 型看不见内容，所以生成时必须把值显示出来，
+   * 否则「把同样的值填进 Worker 环境变量」这一步没法做。
+   * 剪贴板不可用时用户是从下方手抄的，所以展示的那份要和复制的一模一样。
+   */
+  const revealAndCopy = async (value: string, reveal: (v: string) => void, envName: string) => {
+    const text = copyWholeEnvLine ? `${envName}=${value}` : value;
+    reveal(text);
+    try {
+      await navigator.clipboard.writeText(text);
+      addToast(
+        copyWholeEnvLine
+          ? `已复制 ${envName} 整行，粘进 Worker 的 Variables 会自动填好名字和值。`
+          : `已复制 ${envName} 的值（不含变量名），直接粘进 Cloudflare 的值那一栏。`,
+        'success',
+      );
+    } catch {
+      addToast(copyWholeEnvLine ? '已生成，请手动从下方复制整行。' : '已生成，请手动从下方复制。', 'info');
+    }
+  };
+
+  const handleGenerateMasterKey = () => {
+    // 只报「生成了哪一个」。密钥本体只在这次面板打开期间存在于 state，前端不落盘，
+    // 更不会进上报。
+    trackEvent('生成 2.0 Worker 密钥', { which: 'master_key' });
+    return revealAndCopy(ActiveMsgClient.generateMasterKey(), setGeneratedMasterKey, 'AMSG_MASTER_KEY');
+  };
+
+  /**
+   * 开关即时对话。直接落盘而不是走那条 1 秒去抖的自动保存：开关是一次明确的动作，
+   * 点完立刻生效（下一条消息就按新路走），而不是「点完还得等一下」。
+   */
+  const handleToggleInstantChat = async () => {
+    const next = !(config && isInstantChatSwitchedOn(config));
+    // 开了又关是这条路上最值钱的信号：能开、开过、然后放弃了，跟「压根没开」不是一回事。
+    trackEvent('切换即时对话', { action: next ? '开' : '关' });
+    patchConfig({ instantChatEnabled: next });
+    await ActiveMsgStore.saveGlobalConfig({ instantChatEnabled: next });
+    if (next) showInstantChatSendHelp('cloud', true);
+    addToast(next ? '已开启全局即时对话，角色各自关闭的设置会保留。' : '已关闭全局即时对话，所有角色的聊天回到本机生成。', 'success');
+  };
+
+  const handleGenerateServerToken = () => {
+    const token = generateClientToken();
+    patchConfig({ serverToken: token });
+    trackEvent('生成 2.0 Worker 密钥', { which: 'server_token' });
+    return revealAndCopy(token, setGeneratedServerToken, 'AMSG_SERVER_TOKEN');
+  };
+
+  if (!config) {
+    return (
+      <SettingsDetailPage isOpen={isOpen} hidden={covered} title="主动消息设置" onClose={onClose}>
+        <div className="space-y-3 text-sm text-slate-600">
+          <p role={configLoadError ? 'alert' : 'status'}>
+            {configLoadError || '正在读取本地配置…'}
+          </p>
+          {configLoadError ? (
+            <button
+              type="button"
+              onClick={() => void refresh().catch(() => {})}
+              className="w-full py-3 bg-violet-500 text-white font-bold rounded-2xl active:scale-95 transition-transform"
+            >
+              重试读取配置
+            </button>
+          ) : null}
+        </div>
+      </SettingsDetailPage>
+    );
+  }
+
+  const isConnected = Boolean(config.initializedAt && config.workerUrl?.trim());
+  const reconfigureVerified = verifiedConnection?.workerUrl === config.workerUrl
+    && verifiedConnection?.serverToken === (config.serverToken || '');
+  const canContinueConnection = isConnected && !replacementPlan && (reconfigure !== 'review' || reconfigureVerified);
+  const globallyEnabled = isAmsg2GloballyEnabled(config);
+  const globallyPaused = Boolean(config.workerUrl?.trim()) && !globallyEnabled;
+  const instantChatOn = isInstantChatSwitchedOn(config);
+
+  const handleToggleMasterSwitch = async () => {
+    if (loading) return;
+    const next = !globallyEnabled;
+    setLoading(true);
+    try {
+      if (onToggleGlobalEnabled) {
+        await onToggleGlobalEnabled(next);
+      } else {
+        const res = await setAmsg2GlobalEnabled(next, { realtimeConfig });
+        addToast(
+          res.cronNotice || (next ? '已恢复主动消息 2.0。' : '已暂停主动消息 2.0，连接配置已保留。'),
+          res.cronNotice ? 'info' : 'success',
+        );
+      }
+      await refresh();
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 体检：探测结果 + 「这台设备订阅了没」这个只有前端知道的事实，红绿灯判定全在
+  // amsgDiagnostics 那份纯函数里（那边有回归测试钉着）。
+  const diagnosticRows = diagnosticsProbe && pushStatus
+    ? buildAmsgDiagnosticRows({
+      probe: diagnosticsProbe,
+      localPushSubscribed: Boolean(pushStatus?.hasSubscription),
+      pushMode: config.pushMode,
+      // 跟任务卡片同一种写法：cron 一分钟一跳，秒位没有意义。
+      formatTime: (atMs) => formatTaskTime(atMs),
+      tickReport: tickReportResult,
+      // 用户自己暂停了后台任务的话，任务攒着是意料之中，那一行不能报成触发器坏了。
+      cronPaused: cronState?.kind === 'known' && !cronState.enabled,
+    })
+    : [];
+  const diagnosticLevel = diagnosticRows.length ? summarizeAmsgDiagnostics(diagnosticRows) : 'unknown';
+
+  const instantChatBlocker = globallyPaused
+    ? null
+    : resolveInstantChatBlocker({
+      connected: isConnected,
+      pushSubscribed: Boolean(pushStatus?.hasSubscription),
+      workerSupportsInstantChat: instantChatSupported,
+    });
+  const instantChatBlockedReason = globallyPaused
+    ? '总开关已暂停，当前聊天在本机生成；恢复总开关后回到云端生成。'
+    : isConnected && checkingPush
+      ? '正在检查推送状态…'
+      : isConnected && pushCheckError
+        ? '暂时无法确认推送状态，请先重试推送检查。'
+        : instantChatBlocker ? INSTANT_CHAT_BLOCKER_HINTS[instantChatBlocker] : '';
+
+  // ── 各块的内容 ──────────────────────────────────────────────────────────────
+  // 引导和六个横向分区共用同一份内容；切换分区不保存、重载或重置表单。
+
+  /* 体检。主动消息坏掉的那几种方式在界面上全是隐形的：D1 没绑、表结构是旧的、
+     VAPID 没配、云端没登记收件设备——任务照建、面板照常，就是一条都不发。
+     Worker 的 /debug 一直算得出这些，这里只是把它摆到看得见的地方。 */
+  const diagnosticsCard = isAmsg2WorkerActive(config) ? (
+          <div className="amsg-diagnostics space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex-1 flex items-center justify-between gap-2 text-left">
+                <span className="flex items-center gap-2">
+                  <span className="font-bold text-slate-700">体检</span>
+                  {diagnosticRows.length ? (
+                    <span className={`text-xs font-bold ${DIAGNOSTIC_STYLES[diagnosticLevel].text}`}>
+                      {diagnosticLevel === 'ok' ? '都正常' : diagnosticLevel === 'bad' ? '有问题' : diagnosticLevel === 'warn' ? '有提醒' : '查不全'}
+                    </span>
+                  ) : null}
+                </span>
+              </div>
+                <button
+                  type="button"
+                  onClick={() => void runDiagnostics()}
+                  disabled={diagnosing}
+                  className="shrink-0 px-3 py-1.5 text-[11px] rounded-xl font-bold bg-white border border-slate-200 text-slate-600 active:scale-95 transition-transform disabled:opacity-50"
+                >
+                  {diagnosing ? '检查中…' : '重新检查'}
+                </button>
+            </div>
+
+            {diagnosticRows.length ? (
+              <div className="space-y-2">
+                {diagnosticRows.map((row) => {
+                  const style = DIAGNOSTIC_STYLES[row.level];
+                  return (
+                    <div key={row.key}>
+                      <div className="flex items-center gap-2">
+                        <span className={`shrink-0 w-1.5 h-1.5 rounded-full ${style.dot}`} />
+                        <span className="flex-1 text-xs font-bold text-slate-600">{row.label}</span>
+                        <span className={`shrink-0 text-[11px] font-bold ${style.text}`}>{style.word}</span>
+                      </div>
+                      {/* 正常的行不展开说明：全绿时这一列要短到能一眼扫完。 */}
+                      {row.level === 'ok' ? null : (
+                        <p className="mt-1 pl-3.5 text-[11px] leading-relaxed text-slate-500 whitespace-pre-line">
+                          {row.detail}
+                        </p>
+                      )}
+                      {/* 逐条细目（比如每条到点没发的任务现在算哪种情况）。报错原文默认收着：
+                          多半很长，摊开会把整块体检撑满，但排查时又必须看得到原话。 */}
+                      {row.level === 'ok' || !row.items?.length ? null : (
+                        <div className="mt-1.5 pl-3.5 space-y-1.5">
+                          {row.items.map((item, index) => (
+                            <div key={index} className="border-l-2 border-slate-100 pl-2 text-[11px] leading-relaxed text-slate-500">
+                              <p className="whitespace-pre-line">{item.text}</p>
+                              {item.raw ? (
+                                <details className="mt-0.5">
+                                  <summary className="cursor-pointer text-[10px] font-bold text-slate-400">原文</summary>
+                                  <pre className="mt-1 whitespace-pre-wrap break-all font-mono text-[10px] leading-relaxed text-slate-500 bg-slate-50 rounded-lg p-2 select-text">
+                                    {item.raw}
+                                  </pre>
+                                </details>
+                              ) : null}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="text-xs leading-relaxed text-slate-400">
+                {checkingPush ? '正在检查这台设备的推送状态…'
+                  : pushCheckError ? '推送状态暂时无法确认，请先重试推送检查。'
+                  : diagnosing ? '正在问 Worker…' : '还没有结果，点右上角检查一次。'}
+              </p>
+            )}
+          </div>
+  ) : null;
+
+  // Existing connections keep their maintenance view; explicit replacements
+  // retain this card until the stopped backend has safely been activated.
+  const deployCard = config.workerUrl?.trim() && !replacementPlan ? null : (
+        <div className="amsg-deploy-form space-y-4">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-bold text-slate-700">{replacementPlan ? `重新部署 · ${replacementPlan.scriptName}` : '一键部署（推荐）'}</span>
+            <span className="shrink-0 text-[10px] font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full">
+              只要一枚 Token
+            </span>
+          </div>
+
+          {replacementNotice && <p role="status" className="amsg-form-notice">{replacementNotice}</p>}
+          {!replacementNotice && <><p className="text-xs leading-relaxed text-slate-500">
+            在 Cloudflare 建一枚 API Token 粘进来，建数据库、传后端代码、写密钥、加定时触发
+            全都自动做完。不用 GitHub 账号，手机上也走得完。
+          </p>
+
+          <div className="amsg-permissions space-y-1.5">
+            <p className="text-[11px] font-bold text-slate-600">建 Token 时这三项权限都要勾上</p>
+            <ul className="text-[11px] leading-relaxed text-slate-500 space-y-0.5 list-disc list-outside pl-4">
+              <li>Account → <code className="font-mono">Workers Scripts</code> : Edit</li>
+              <li>Account → <code className="font-mono">D1</code> : Edit</li>
+              <li>Account → <code className="font-mono">Account Settings</code> : Read</li>
+            </ul>
+            <a
+              href={CF_TOKEN_URL}
+              target="_blank"
+              rel="noreferrer"
+              onClick={() => trackEvent('打开 2.0 部署外链', { target: 'CF面板' })}
+              className="inline-block mt-1 text-[11px] font-bold text-violet-600"
+            >
+              ↗ 去 Cloudflare 建 Token
+            </a>
+          </div>
+
+          </>}
+          <input
+            type="password"
+            value={cfToken}
+            onChange={(e) => setCfToken(e.target.value)}
+            placeholder="粘贴 Cloudflare API Token"
+            autoComplete="off"
+            className="w-full px-3 py-2.5 rounded-xl border border-slate-200 text-sm outline-none focus:border-violet-400"
+          />
+
+          {provisionAccounts?.length ? (
+            <div className="space-y-1.5">
+              <p className="text-[11px] font-bold text-slate-600">这枚 Token 能用在多个账号上，装到哪个？</p>
+              {provisionAccounts.map((account) => (
+                <button
+                  key={account.id}
+                  type="button"
+                  disabled={provisioning}
+                  onClick={() => void handleOneClickDeploy(account.id)}
+                  className="w-full px-3 py-2.5 rounded-xl text-xs font-bold bg-white border border-slate-200 text-slate-600 text-left active:scale-95 transition-transform disabled:opacity-50"
+                >
+                  {account.name}
+                </button>
+              ))}
+            </div>
+          ) : null}
+
+          {needsSubdomain ? (
+            <div className="space-y-1.5">
+              <p className="text-[11px] font-bold text-slate-600">给这个账号起一个 workers.dev 子域名</p>
+              <input
+                type="text"
+                value={desiredSubdomain}
+                onChange={(e) => setDesiredSubdomain(e.target.value)}
+                placeholder="例如 my-name（全 Cloudflare 唯一）"
+                autoComplete="off"
+                className="w-full px-3 py-2.5 rounded-xl border border-slate-200 text-sm outline-none focus:border-violet-400"
+              />
+              <p className="text-[11px] leading-relaxed text-slate-400">
+                后端地址会长这样：<code className="font-mono">sullyos-amsg.你填的.workers.dev</code>。
+                这个名字定了就是这个账号所有 Worker 共用的，之后不好改。
+              </p>
+            </div>
+          ) : null}
+
+          <button
+            type="button"
+            disabled={provisioning || !cfToken.trim()}
+            onClick={() => void handleOneClickDeploy()}
+            className="w-full py-3 rounded-xl text-sm font-bold bg-violet-500 text-white active:scale-95 transition-transform disabled:opacity-50"
+          >
+            {provisioning ? provisionStep || '部署中…' : replacementNotice ? '检查并继续重新部署' : '开始部署'}
+          </button>
+
+          {provisionError ? (
+            <p className="text-[11px] leading-relaxed text-rose-600 whitespace-pre-line">{provisionError}</p>
+          ) : null}
+
+          {staleDatabase ? (
+            <button
+              type="button"
+              disabled={provisioning || !cfToken.trim()}
+              onClick={() => {
+                if (!confirm('旧数据库里的数据会全部清掉（已排的主动消息、云端保存的角色状态和凭据），清了找不回来。\n\n确定清空并继续部署吗？')) return;
+                void handleOneClickDeploy(staleDatabase.accountId, true);
+              }}
+              className="w-full py-2.5 rounded-xl text-xs font-bold bg-white border border-rose-300 text-rose-600 active:scale-95 transition-transform disabled:opacity-50"
+            >
+              清空旧数据并继续部署
+            </button>
+          ) : null}
+
+          <p className="text-[10px] leading-relaxed text-slate-400">
+            Token 会经本站中转一次，部署完存进<strong>你自己的</strong> Worker，以后更新后端也用它；
+            本页不保存。介意的话可以手动配置。
+          </p>
+
+          {/* 手动配置只给明确选了这条路的人看：入口做成一行浅色小字，平时所有人都走上面的一键部署。 */}
+          {!replacementPlan && <button
+            type="button"
+            onClick={() => setManualSetupOpen((prev) => {
+              // 只在展开时记一笔：收起也记的话同一个人会被数两次。
+              if (!prev) trackEvent('展开 2.0 部署指引', { mode: '手动配置' });
+              return !prev;
+            })}
+            className="w-full flex items-center justify-between text-left text-[11px] font-bold text-slate-400"
+          >
+            <span>我要手动配置</span>
+            <span>{manualSetupOpen ? '收起' : '展开'}</span>
+          </button>}
+
+          {manualSetupOpen && !replacementPlan ? (
+            <div className="space-y-2.5">
+              <p className="text-[11px] leading-relaxed text-slate-500">
+                手动配置要自己在 Cloudflare 后台建数据库和 Worker、填密钥，步骤比较多，照着教程一步步来。
+                下面是教程里要用到的几样东西。
+              </p>
+              <a
+                href={MANUAL_SETUP_TUTORIAL_URL}
+                target="_blank"
+                rel="noreferrer"
+                onClick={() => trackEvent('打开 2.0 部署外链', { target: '手动配置教程' })}
+                className="block w-full py-2.5 rounded-xl text-xs font-bold bg-white border border-slate-200 text-slate-600 text-center active:scale-95 transition-transform"
+              >
+                ↗ 手动配置教程（Discord）
+              </a>
+              <button
+                type="button"
+                onClick={() => void handleCopyWorkerBundle()}
+                className="w-full py-2.5 rounded-xl text-xs font-bold bg-white border border-slate-200 text-slate-600 active:scale-95 transition-transform"
+              >
+                复制 Worker 代码
+              </button>
+              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-3 space-y-2.5 text-xs">
+                <p className="font-bold text-slate-700">环境变量清单</p>
+
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <code className="font-mono text-[11px] text-slate-600">AMSG_MASTER_KEY</code>
+                    <button
+                      type="button"
+                      onClick={() => void handleGenerateMasterKey()}
+                      className="shrink-0 px-3 py-1.5 text-[11px] rounded-xl font-bold bg-white border border-slate-200 text-slate-600 active:scale-95 transition-transform"
+                    >
+                      生成并复制
+                    </button>
+                  </div>
+                  {generatedMasterKey ? (
+                    <SecretReveal value={generatedMasterKey} />
+                  ) : (
+                    <p className="text-[11px] text-slate-400">
+                      加密任务内容用的密钥，只存在 Worker 侧。本页不保存。
+                      {copyWholeEnvLine
+                        ? <>复制出来是 <code className="font-mono">变量名=值</code> 整行，粘进 CF 的 Variables 会自动分好两栏。</>
+                        : <>复制出来只有值本身，直接粘进 CF 里那一项的值那一栏。</>}
+                    </p>
+                  )}
+                </div>
+
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <code className="font-mono text-[11px] text-slate-600">VAPID_EMAIL / PUBLIC_KEY / PRIVATE_KEY</code>
+                    {onOpenVapid ? (
+                      <button
+                        type="button"
+                        onClick={onOpenVapid}
+                        className="shrink-0 px-3 py-1.5 text-[11px] rounded-xl font-bold bg-white border border-slate-200 text-slate-600 active:scale-95 transition-transform"
+                      >
+                        去推送凭据面板
+                      </button>
+                    ) : null}
+                  </div>
+                  <p className="text-[11px] text-slate-400">
+                    必须和「推送凭据 (VAPID)」面板里的是<strong>同一对</strong>——
+                    整个站点只有一个浏览器推送订阅，Worker 用别的密钥对签推送会 403。
+                  </p>
+                </div>
+
+                <div className="space-y-1">
+                  <code className="font-mono text-[11px] text-slate-600">AMSG_SERVER_TOKEN（可选）</code>
+                  <p className="text-[11px] text-slate-400">
+                    防止别人滥用你的 Worker。值 = 下面「共享密钥」（点「展开」才出现）填的那串，两边一致即可；不配则端点全开。
+                  </p>
+                </div>
+              </div>
+            </div>
+          ) : null}
+        </div>
+  );
+
+  // 数据边界放在打开时的确认弹窗里（relayConfirmDialog），这里只留一句用途
+  const relayToggle = (
+    <div className="bg-white/70 border border-slate-200 rounded-2xl px-4 py-3 space-y-3">
+      <label className="flex items-start gap-3">
+        <input
+          type="checkbox"
+          checked={relayAllowed && !!config.useRelay}
+          disabled={!relayAllowed}
+          onChange={(event) => handleToggleRelay(event.target.checked)}
+          className="mt-0.5 shrink-0 disabled:opacity-40"
+        />
+        <span className="space-y-1">
+          <span className="block text-xs font-bold text-slate-700">大陆连接优化</span>
+          <span className="block text-[11px] leading-relaxed text-slate-400">
+            大陆网络连不上 Worker 时打开，请求经维护者的中转服务器转给你的 Worker。
+          </span>
+          {relayDeployment === 'other' ? (
+            <span className="block text-[11px] leading-relaxed text-amber-600">
+              为防止二改中修改过的主动消息逻辑产生未经认证的流量（可能会被判定为滥用），非官方版本不能使用官方中转。
+            </span>
+          ) : null}
+          {relayAllowed && config.useRelay && config.workerUrl?.trim() && !canRelayWorkerUrl(config.workerUrl) ? (
+            <span className="block text-[11px] leading-relaxed text-amber-600">
+              中转只支持 https 域名地址，不能是 IP，也不能带端口或路径。现在这个地址会直接连。
+            </span>
+          ) : null}
+        </span>
+      </label>
+      {relayAllowed && config.useRelay ? (
+        <label className="block space-y-1.5">
+          <span className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest pl-1">中转令牌</span>
+          <input
+            type="password"
+            value={config.relayToken || ''}
+            onChange={(event) => void saveRelayToken(event.target.value)}
+            placeholder="在 SullyOS 的 Discord 群里发 /中转令牌 领取"
+            className="w-full bg-white border border-slate-200 rounded-2xl px-4 py-3 text-xs font-mono"
+          />
+          {!isRelayTokenWellFormed(config.relayToken) ? (
+            <span className="block text-[11px] leading-relaxed text-amber-600 pl-1">填好令牌后才会走中转，现在仍是直连</span>
+          ) : relayUsage?.kind === 'ok' ? (
+            <span className="block text-[11px] leading-relaxed text-slate-500 pl-1">
+              近 30 天：上传 {formatBytes(relayUsage.last30.up) || '0 B'} · 下载 {formatBytes(relayUsage.last30.down) || '0 B'} · {relayUsage.last30.requests} 次请求
+            </span>
+          ) : relayUsage?.kind === 'invalid-token' ? (
+            <span className="block text-[11px] leading-relaxed text-amber-600 pl-1">令牌无效或已过期，请在群里重新发 /中转令牌</span>
+          ) : relayUsage?.kind === 'error' ? (
+            <span className="block text-[11px] leading-relaxed text-slate-400 pl-1">暂时查不到用量</span>
+          ) : null}
+        </label>
+      ) : null}
+    </div>
+  );
+
+  const workerBody = (
+    <>
+          {workerOutdated ? (
+            <div className="bg-amber-50 border border-amber-200 rounded-2xl px-4 py-3 text-xs leading-relaxed text-amber-700">
+              Worker 上跑的还是旧版代码，缺少新特性（大上下文云端存储、服务端工具循环等）。
+              点下方的<strong>「更新 Worker」</strong>就能换上新版，已有数据和任务不受影响。
+            </div>
+          ) : null}
+
+          <div>
+            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 block pl-1">
+              Worker 地址
+            </label>
+            <input
+              type="text"
+              value={config.workerUrl}
+              onChange={(event) => patchConfig({ workerUrl: event.target.value })}
+              placeholder="https://amsg.你的账号.workers.dev"
+              className="w-full bg-white/70 border border-slate-200 rounded-2xl px-4 py-3 text-xs font-mono"
+            />
+            <a
+              href={DIRECT_CONNECT_TUTORIAL_URL}
+              target="_blank"
+              rel="noreferrer"
+              onClick={() => trackEvent('打开 2.0 部署外链', { target: '直连教程' })}
+              className="mt-2 flex items-center justify-between text-[11px] font-bold text-slate-400"
+            >
+              <span>这个地址连不上？看直连教程</span>
+              <span>↗</span>
+            </a>
+          </div>
+
+          {relayToggle}
+
+          {/*
+            共享密钥默认收着：一键部署会自己生成并填好，跟 Worker 上的 AMSG_SERVER_TOKEN 是同一串。
+            这里一改（尤其是误点「随机」）两边就对不上，之后每个请求都 401。只有手动配置或
+            从别的设备搬过来的人才需要动它，所以入口做成一行浅色小字，点开才有输入框。
+          */}
+          <div className="space-y-2">
+            <button
+              type="button"
+              aria-expanded={serverTokenOpen}
+              onClick={() => setServerTokenOpen((prev) => !prev)}
+              className="w-full flex items-center justify-between text-left text-[11px] font-bold text-slate-400 pl-1"
+            >
+              <span>共享密钥 · {config.serverToken ? '已填好' : '未填'}</span>
+              <span>{serverTokenOpen ? '收起' : '展开'}</span>
+            </button>
+            {serverTokenOpen ? (
+              <>
+                <p className="text-[11px] leading-relaxed text-slate-400 pl-1">
+                  一键部署已经自动填好，不用动。改了的话要和 Worker 上的 AMSG_SERVER_TOKEN 保持一致，否则会连不上。
+                </p>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    value={config.serverToken || ''}
+                    onChange={(event) => patchConfig({ serverToken: event.target.value })}
+                    placeholder="worker 配了 AMSG_SERVER_TOKEN 才需要填"
+                    className="flex-1 bg-white/70 border border-slate-200 rounded-2xl px-4 py-3 text-sm"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void handleGenerateServerToken()}
+                    className="shrink-0 px-3 py-3 text-xs rounded-2xl font-bold bg-white border border-slate-200 text-slate-600 active:scale-95 transition-transform"
+                  >
+                    随机
+                  </button>
+                </div>
+                {generatedServerToken ? (
+                  <SecretReveal value={generatedServerToken} className="mt-1.5" />
+                ) : null}
+              </>
+            ) : null}
+          </div>
+
+          {/*
+            部署还没收尾时这个按钮必须是点不动的：刚建好的 workers.dev 地址要过几十秒才在
+            各个边缘节点上都解析得到，这期间点连接必然报「连不上 Worker」。一键部署那条路
+            自己会等（waitForWorkerReady），等到了还会顺手把表建好——用户抢在前面点，
+            收获的只有一次莫名其妙的失败。
+          */}
+          <button
+            onClick={handleConnect}
+            disabled={loading || provisioning}
+            className="w-full py-3 bg-slate-900 text-white font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-50"
+          >
+            {provisioning
+              ? provisionStep || '部署中…'
+              : loading ? '处理中...' : isConnected ? '重新连接并验证' : '连接并启用'}
+          </button>
+
+          {isConnected ? (
+            <div className="pt-1 space-y-2 border-t border-slate-200">
+              {/*
+                按钮常驻，但有更新时才抢眼：有新版就实心高亮并写明更新到哪一版，
+                没新版时弱化成一行浅色的「重新检查并更新」——想手动重跑一次的人照样点得到，
+                不用为了这个去别处找入口。
+              */}
+              <button
+                onClick={handleSelfUpdateWorker}
+                disabled={loading || globallyPaused}
+                className={`w-full py-2.5 font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-50 ${
+                  workerVersion?.state === 'outdated'
+                    ? 'bg-emerald-600 text-white border border-emerald-600'
+                    : 'bg-white border border-slate-300 text-slate-700'
+                }`}
+              >
+                {loading
+                  ? '处理中...'
+                  : workerVersion?.state === 'outdated'
+                    ? `更新 Worker 到 ${workerVersion.expected}`
+                    : '重新检查并更新 Worker'}
+              </button>
+              {workerVersion?.state === 'outdated' ? (
+                <p className="text-xs leading-relaxed text-emerald-700">
+                  你这台 Worker 上跑的是
+                  {workerVersion.deployed ? <code className="font-mono"> {workerVersion.deployed} </code> : '更早的版本'}
+                  ，更新后即时对话才走得上新的生成通道。
+                </p>
+              ) : workerVersion?.state === 'ahead' ? (
+                <p className="text-xs leading-relaxed text-emerald-700">
+                  后端已经是更新的
+                  <code className="font-mono"> {workerVersion.deployed} </code>
+                  ，这个页面还是旧版（<code className="font-mono">{workerVersion.expected}</code>），刷新页面就能用上新版 App。
+                </p>
+              ) : workerVersion?.state === 'current' ? (
+                <p className="text-xs leading-relaxed text-slate-500">
+                  后端已经是最新版（<code className="font-mono">{workerVersion.expected}</code>）。
+                </p>
+              ) : null}
+              {/*
+                装了钥匙的（一键部署、或补过钥匙）后端会自己定期查新代码，这里报它的近况；
+                没钥匙的沿用原来那段说明。文案出自 describeAmsgSelfUpdate，跟 worker 记的状态同源。
+              */}
+              {autoUpdateText ? (
+                <p className={`text-xs leading-relaxed ${workerVersion?.autoUpdate?.state?.lastOutcome === 'failed' ? 'text-amber-700' : 'text-slate-500'}`}>
+                  {autoUpdateText}
+                </p>
+              ) : null}
+              <p className="text-xs leading-relaxed text-slate-500">
+                后端自己去取最新代码覆盖自己，你排好的任务和填过的密钥都不动，更新完会自动验证一次。
+                {autoUpdateText
+                  ? '平时不用管，想立刻更新就点上面这颗。'
+                  : '用一键部署装的可以直接点，装完以后后端还会自己定期更新；老办法装的第一次点会提示补一把钥匙，就在下面补，补完同样自动更新。'}
+              </p>
+              {selfUpdateHash ? (
+                <p className="text-xs leading-relaxed text-emerald-600">
+                  当前后端代码指纹：<code className="font-mono">{selfUpdateHash}</code>
+                </p>
+              ) : null}
+
+              {/* 暂停 / 恢复后台任务：摘掉或加回 Worker 的 cron trigger。旧版 Worker 没这个端点时整块不显示。 */}
+              {cronState ? (
+                <>
+                  <button
+                    onClick={handleCronTriggerClick}
+                    disabled={loading}
+                    className={`w-full py-2.5 font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-50 ${
+                      cronState.kind === 'known' && !cronState.enabled
+                        ? 'bg-amber-500 text-white border border-amber-500'
+                        : 'bg-white border border-slate-300 text-slate-700'
+                    }`}
+                  >
+                    {loading
+                      ? '处理中...'
+                      : cronState.kind === 'known' && !cronState.enabled
+                        ? '恢复后台任务'
+                        : '暂停后台任务'}
+                  </button>
+                  <p className="text-xs leading-relaxed text-slate-500">
+                    暂停会摘掉 Worker 的定时触发，到点的主动消息和定时消息先攒在云端，不会丢；恢复后一起补发。
+                  </p>
+                </>
+              ) : null}
+
+              {attachOpen ? (
+                <div className="bg-slate-50 border border-slate-200 rounded-2xl p-3 space-y-2.5">
+                  <p className="text-[11px] font-bold text-slate-600">给这台后端补一把更新用的钥匙</p>
+                  <p className="text-[11px] leading-relaxed text-slate-500">
+                    建一枚只勾 <strong>Account → Workers Scripts : Edit</strong> 的 Cloudflare API Token
+                    粘进来（<strong>Start Date 留空</strong>），SullyOS·糯米机 会把它写进你这台 Worker。
+                    做完一次以后更新就都是点上面那个按钮了。
+                  </p>
+                  <a
+                    href={CF_TOKEN_URL}
+                    target="_blank"
+                    rel="noreferrer"
+                    onClick={() => trackEvent('打开 2.0 部署外链', { target: 'CF面板' })}
+                    className="inline-block text-[11px] font-bold text-violet-600"
+                  >
+                    ↗ 去 Cloudflare 建 Token
+                  </a>
+                  <input
+                    type="password"
+                    value={attachToken}
+                    onChange={(e) => setAttachToken(e.target.value)}
+                    placeholder="粘贴 Cloudflare API Token"
+                    autoComplete="off"
+                    className="w-full px-3 py-2.5 rounded-xl border border-slate-200 text-sm outline-none focus:border-violet-400"
+                  />
+
+                  {attachNeedsScriptName ? (
+                    <input
+                      type="text"
+                      value={attachScriptName}
+                      onChange={(e) => setAttachScriptName(e.target.value)}
+                      placeholder="这台 Worker 在 Cloudflare 上的名字"
+                      autoComplete="off"
+                      className="w-full px-3 py-2.5 rounded-xl border border-slate-200 text-sm outline-none focus:border-violet-400"
+                    />
+                  ) : null}
+
+                  {attachAccounts?.length ? (
+                    <div className="space-y-1.5">
+                      <p className="text-[11px] font-bold text-slate-600">多个账号下都有同名 Worker，选一个：</p>
+                      {attachAccounts.map((account) => (
+                        <button
+                          key={account.id}
+                          type="button"
+                          disabled={attaching}
+                          onClick={() => void handleAttachUpdateKey(account.id)}
+                          className="w-full px-3 py-2.5 rounded-xl text-xs font-bold bg-white border border-slate-200 text-slate-600 text-left active:scale-95 transition-transform disabled:opacity-50"
+                        >
+                          {account.name}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  <button
+                    type="button"
+                    disabled={attaching || !attachToken.trim()}
+                    onClick={() => void handleAttachUpdateKey()}
+                    className="w-full py-2.5 rounded-xl text-xs font-bold bg-violet-500 text-white active:scale-95 transition-transform disabled:opacity-50"
+                  >
+                    {attaching ? '装钥匙中…' : '装上钥匙'}
+                  </button>
+
+                  {attachError ? (
+                    <p className="text-[11px] leading-relaxed text-rose-600 whitespace-pre-line">{attachError}</p>
+                  ) : null}
+
+                  <p className="text-[10px] leading-relaxed text-slate-400">
+                    这一步只往你的 Worker 里加这一条密钥，不动代码、不动数据库、不动已有的密钥。
+                    Token 写进去之后就留在你自己的 Worker 里，本页不保存。
+                  </p>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+    </>
+  );
+
+  const nativeApp = detectCapacitorNative() || pushStatus?.transport === 'unified-push';
+  const pushTitle = config.pushMode === 'third-party'
+    ? '第三方推送 App'
+    : nativeApp ? '第三方推送 · ntfy' : '通知与推送通道';
+  const nativePermissionMissing = pushStatus?.transport === 'unified-push' && pushStatus.permission !== 'granted';
+  const pushStatusText = globallyPaused ? '已暂停' : checkingPush ? '检查中…' : pushCheckError ? '暂时无法检查' : pushStatus?.hasSubscription ? nativePermissionMissing ? '已连接 · 待允许通知' : '已开启' : '未开启';
+  const pushStatusClass = globallyPaused || checkingPush || pushCheckError ? 'text-slate-400' : pushStatus?.hasSubscription && !nativePermissionMissing ? 'text-emerald-600' : 'text-amber-600';
+  const pushBody = (
+    <>
+          <PushModeSelector nativeApp={nativeApp} thirdParty={nativeApp || config.pushMode === 'third-party'} disabled={loading}
+            onSelect={mode => { if (!nativeApp) void handleSwitchPushMode(mode); }} />
+
+          {nativeApp && <>
+            <p id={`${tabPrefix}-native-push-note`} className="amsg-native-push-note">当前为 App 版本，系统推送仅适用于网页 / PWA。请使用 ntfy 等第三方接收方案；通知仍会显示在手机通知栏。</p>
+            <div className="amsg-native-provider">
+              <label htmlFor={`${tabPrefix}-native-provider`}>第三方接收方案</label>
+              <select id={`${tabPrefix}-native-provider`} disabled={loading} value={config.pushMode === 'third-party' ? getThirdPartyPushProviderMeta(config.thirdPartyPush?.provider).id : 'ntfy'} onChange={event => {
+                const provider = event.target.value;
+                // ntfy remains on the existing UnifiedPush path. Presentation must not migrate stored pushMode.
+                if (provider === 'ntfy') { if (config.pushMode === 'third-party') void handleSwitchPushMode('web-push'); }
+                else void handleSelectThirdPartyProvider(provider as ThirdPartyPushProvider);
+              }}>
+                <option value="ntfy">ntfy（UnifiedPush）</option>
+                {THIRD_PARTY_PUSH_PROVIDERS.map(provider => <option key={provider.id} value={provider.id}>{provider.label}</option>)}
+              </select>
+            </div>
+          </>}
+
+          {config.pushMode === 'third-party' ? (
+            (() => {
+              const tp = config.thirdPartyPush || { provider: 'wxpusher' as const, token: '' };
+              const providerMeta = getThirdPartyPushProviderMeta(tp.provider);
+              const liveValidation = validateThirdPartyPushConfig(tp);
+              const savedAndMatched = Boolean(
+                liveValidation.ok
+                && pushStatus?.hasSubscription
+                && pushStatus?.thirdPartyProvider === providerMeta.id,
+              );
+              const liveDetail = !liveValidation.ok
+                ? liveValidation.error
+                : !config.workerUrl?.trim()
+                  ? '请先填写 Worker 地址。'
+                  : savedAndMatched
+                    ? `第三方推送：${providerMeta.shortLabel}`
+                    : `已填写 ${providerMeta.shortLabel} 配置，请点击下方「保存并登记推送」生效。`;
+              return (
+                <div className="space-y-3">
+                  <p className="text-xs leading-relaxed text-slate-500">
+                    通过手机上的第三方推送 App 转发系统级通知，可绕过老版本 iOS 不支持网页推送（Web Push）的限制，
+                    也不受 Google 推送服务器在国内网络波动的影响。打开 SullyOS 时会自动从云端收件箱拉取完整角色消息。
+                  </p>
+
+                  {!nativeApp && <div className="space-y-1.5">
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest block pl-1">
+                      选择推送平台
+                    </label>
+                    <div className="space-y-1.5">
+                      {THIRD_PARTY_PUSH_PROVIDERS.map((item) => {
+                        const selected = !showNtfyInfo && providerMeta.id === item.id;
+                        return (
+                          <button
+                            key={item.id}
+                            type="button"
+                            onClick={() => void handleSelectThirdPartyProvider(item.id as ThirdPartyPushProvider)}
+                            className={`w-full text-left px-3 py-2.5 rounded-xl border transition-colors flex items-center justify-between gap-2 ${
+                              selected
+                                ? 'bg-violet-50 border-violet-300 text-violet-900'
+                                : 'bg-white border-slate-200 text-slate-700'
+                            }`}
+                          >
+                            <span className="text-xs font-bold">{item.label}</span>
+                            <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold ${
+                              selected ? 'bg-violet-200/70 text-violet-800' : 'bg-slate-100 text-slate-500'
+                            }`}>
+                              {item.badge}
+                            </span>
+                          </button>
+                        );
+                      })}
+                      <button type="button" aria-label="ntfy（APK 自动连接）" aria-pressed={showNtfyInfo} onClick={() => setShowNtfyInfo(true)} className={`w-full text-left px-3 py-2.5 rounded-xl border transition-colors flex items-center justify-between gap-2 ${showNtfyInfo ? 'bg-violet-50 border-violet-300 text-violet-900' : 'bg-white border-slate-200 text-slate-700'}`}>
+                        <span className="text-xs font-bold">ntfy</span><span className="text-[10px] px-2 py-0.5 rounded-full font-semibold bg-slate-100 text-slate-500">APK 自动连接</span>
+                      </button>
+                    </div>
+                  </div>}
+
+                  {!nativeApp && showNtfyInfo ? <div className="amsg-form-notice space-y-2" role="status">
+                    <h4 className="font-semibold">ntfy · 在 Android App 中连接</h4>
+                    <p>原来的 ntfy 自动连接仍然可用。请在 Android App 的「通知与设备 → 第三方推送 App」选择「ntfy（UnifiedPush）」，然后连接通知。</p>
+                    <p>已经配好的设备继续沿用原连接。网页无法调用 App 的自动连接，请在原设备上检查或重新连接。</p>
+                  </div> : <>
+                  <p className="text-[11px] leading-relaxed text-slate-500 bg-white border border-slate-200 rounded-xl px-3 py-2.5">
+                    {providerMeta.helpText}
+                  </p>
+
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1 block pl-1">
+                      {providerMeta.tokenLabel}
+                    </label>
+                    <input
+                      type="text"
+                      value={tp.token || ''}
+                      onChange={(e) => patchConfig({
+                        pushMode: 'third-party',
+                        thirdPartyPush: {
+                          ...tp,
+                          provider: providerMeta.id,
+                          token: e.target.value,
+                        },
+                      })}
+                      placeholder={providerMeta.tokenPlaceholder}
+                      autoComplete="off"
+                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2.5 text-xs font-mono"
+                    />
+                  </div>
+
+                  {providerMeta.supportsCustomServer ? (
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1 block pl-1">
+                        自定义服务器地址（可选，留空用官方服务器）
+                      </label>
+                      <input
+                        type="text"
+                        value={tp.serverUrl || ''}
+                        onChange={(e) => patchConfig({
+                          pushMode: 'third-party',
+                          thirdPartyPush: {
+                            ...tp,
+                            provider: providerMeta.id,
+                            serverUrl: e.target.value,
+                          },
+                        })}
+                        placeholder={providerMeta.defaultServerOrigin || 'https://'}
+                        autoComplete="off"
+                        className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2.5 text-xs font-mono"
+                      />
+                    </div>
+                  ) : null}
+
+                  {liveDetail ? (
+                    <p className={`text-xs leading-relaxed ${savedAndMatched ? 'text-emerald-600' : 'text-amber-600'}`}>
+                      {liveDetail}
+                    </p>
+                  ) : null}
+
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleSaveThirdPartyPush()}
+                      disabled={loading}
+                      className="flex-1 py-3 bg-violet-500 text-white font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-50 text-xs"
+                    >
+                      {loading ? '处理中...' : '保存并登记推送'}
+                    </button>
+                    {isConnected && pushStatus?.hasSubscription ? (
+                      <button
+                        type="button"
+                        onClick={() => void handleSendTestPush()}
+                        disabled={loading || globallyPaused}
+                        className="shrink-0 px-3.5 py-3 bg-white border border-slate-300 text-slate-700 font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-50 text-xs"
+                      >
+                        发送测试通知
+                      </button>
+                    ) : null}
+                  </div>
+                  </>}
+                </div>
+              );
+            })()
+          ) : (
+            <>
+              {nativeApp ? (
+                <p className="text-xs leading-relaxed text-slate-500">
+                  保持 ntfy 在后台运行，并允许本 App 发送通知。换设备后，在这里重新连接通知，接收位置会切换到这台设备。
+                </p>
+              ) : (
+                <p className="text-xs leading-relaxed text-slate-500">
+                  若你的 iOS 版本不支持网页推送，或受网络影响（如谷歌浏览器）收不到通知，可切换到上方的「第三方推送 App」。
+                  换了设备或浏览器，在新设备上点一次「开启通知与推送」，会覆盖原来的订阅，之后通知只发到新设备。
+                </p>
+              )}
+              {pushStatus?.needsDistributor ? (
+                <a
+                  href="https://docs.ntfy.sh/subscribe/phone/"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="block text-xs font-bold text-violet-600 underline"
+                >
+                  安装并打开 ntfy（选择无 Firebase 版本）
+                </a>
+              ) : null}
+              {pushStatus?.detail ? (
+                <p className={`text-xs leading-relaxed ${pushStatus.hasSubscription && pushStatus.permission === 'granted' ? 'text-slate-500' : 'text-amber-600'}`}>{pushStatus.detail}</p>
+              ) : null}
+              {pushCheckError ? (
+                <div role="alert" className="space-y-2 text-xs text-amber-600">
+                  <p>{pushCheckError}</p>
+                  <button type="button" onClick={() => void refreshPushStatus(config)} className="font-bold underline">
+                    重试推送检查
+                  </button>
+                </div>
+              ) : null}
+              <div className="flex gap-2">
+                <button
+                  onClick={handleCreateSubscription}
+                  disabled={loading || globallyPaused || !isConnected}
+                  className="flex-1 py-3 bg-violet-500 text-white font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-50"
+                >
+                  {loading ? '处理中...' : nativeApp ? (pushStatus?.hasSubscription && !nativePermissionMissing ? '重新连接通知' : '连接 ntfy 并开启通知') : '开启通知与推送'}
+                </button>
+                {isConnected && pushStatus?.hasSubscription ? (
+                  <button
+                    type="button"
+                    onClick={() => void handleSendTestPush()}
+                    disabled={loading || globallyPaused}
+                    className="shrink-0 px-3.5 py-3 bg-white border border-slate-300 text-slate-700 font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-50 text-xs"
+                  >
+                    发送测试通知
+                  </button>
+                ) : null}
+              </div>
+            </>
+          )}
+          {onOpenPushStatus && !workspaceSection && <button type="button" onClick={onOpenPushStatus} className="block w-full py-3 text-left text-xs font-semibold text-violet-600">查看通知状态与补收 →</button>}
+    </>
+  );
+
+  /* 即时对话：聊天本身也交给云端跑。几道门缺一不可，缺哪道就把哪道写出来——
+     置灰而不说原因的话，用户只会反复点它。
+     开着但有门没过时状态不能只写「已开启」——那几道门是真的会让这一轮走本地生成的，
+     标成绿色的「已开启」就是在骗人：用户以为聊天在云端跑，实际一直在本地。 */
+  const instantStatusText = !instantChatOn ? '未开启' : instantChatBlockedReason ? '已开启 · 暂不生效' : '已开启';
+  const instantStatusClass = !instantChatOn ? 'text-slate-400' : instantChatBlockedReason ? 'text-amber-600' : 'text-emerald-600';
+  const instantBody = (
+    <>
+      <p className="amsg-form-notice">这里设置即时对话总开关。后端连接成功后默认开启，明确关闭过的设置会保留。角色默认跟随，也可单独关闭，与角色的主动消息排程开关互不影响。</p>
+      {/* 「即时」容易被读成「秒回、不走模型」，所以第一句先把这个误会拆掉，再讲开和关差在哪。 */}
+      <p className="text-xs leading-relaxed text-slate-500">
+        「即时」不是秒回。回复照样由你配的模型现写，要等多久、花多少 API 费用都和平时一样，变的只是<strong>在哪儿写</strong>。
+      </p>
+      <div className="bg-white border border-slate-200 rounded-xl divide-y divide-slate-100 text-xs leading-relaxed text-slate-500">
+        <div className="px-3 py-2.5">
+          <p className="font-bold text-slate-600">关着</p>
+          <p>回复在这台设备的页面里写。写完之前页面得一直开着，切到后台、锁屏，或者 App 被杀后台，这条回复就断了。</p>
+        </div>
+        <div className="px-3 py-2.5">
+          <p className="font-bold text-violet-600">开着</p>
+          <p>回复在你的云端后端里写，写好了用通知送回来。发完消息就算把 App 杀后台也没关系，回来时消息已经在那儿了。</p>
+        </div>
+      </div>
+      {instantChatBlockedReason ? (
+        <p className="text-xs leading-relaxed text-amber-600">{instantChatBlockedReason}</p>
+      ) : (
+        <p className="text-[11px] leading-relaxed text-slate-400">
+          开着时没有逐字吐出，生成期间显示「正在输入…」；云端明确报错才会提示重发，只要还在生成或重试就一直等（LLM 慢不算失败）。
+        </p>
+      )}
+      <button
+        type="button"
+        onClick={() => void handleToggleInstantChat()}
+        disabled={loading || (!globallyPaused && !instantChatOn && !!instantChatBlockedReason)}
+        className={`w-full py-3 font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-40 ${
+          instantChatOn ? 'bg-slate-200 text-slate-600' : 'bg-slate-900 text-white'
+        }`}
+      >
+        {instantChatOn ? '关闭全局即时对话' : '开启全局即时对话'}
+      </button>
+    </>
+  );
+
+  const advancedBody = (
+            <div className="space-y-3 text-xs">
+              <div className="bg-violet-50 border border-violet-100 rounded-2xl p-3 space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="font-semibold text-slate-700">X-User-Id</span>
+                  <span className="font-mono text-violet-600">{maskActiveMsgUserId(config.userId)}</span>
+                </div>
+              </div>
+              <p className="text-[11px] leading-relaxed text-slate-500">
+                发布的 Worker 代码默认 CORS 全开
+                （<code className="font-mono">origin: '*'</code>），想收紧就把它改成自己站点的域名再部署。
+              </p>
+              {onOpenCloudData ? (
+                <div className="bg-white border border-slate-200 rounded-2xl p-3 space-y-2">
+                  <div className="font-semibold text-slate-700">云端数据</div>
+                  <p className="text-[11px] leading-relaxed text-slate-500">
+                    直接查看 Worker 保存的任务、上下文、凭据和结果，按实际范围清理。
+                    本机未关联的角色也会显示；其他设备可能还在使用。
+                  </p>
+                  <button
+                    onClick={onOpenCloudData}
+                    className="w-full py-2.5 bg-slate-100 text-slate-700 font-bold rounded-2xl active:scale-95 transition-transform"
+                  >
+                    云端数据管理
+                  </button>
+                </div>
+              ) : null}
+
+            </div>
+  );
+
+  // ── 引导 ────────────────────────────────────────────────────────────────────
+
+  const cardClass = 'bg-white border border-slate-200 rounded-2xl p-4 space-y-3';
+  const mutedCardClass = 'bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3';
+  const cardHeader = (title: string, status: string, statusClass: string) => (
+    <div className="flex items-center justify-between gap-3">
+      <span className="font-bold text-slate-700">{title}</span>
+      <span className={`text-xs font-bold ${statusClass}`}>{status}</span>
+    </div>
+  );
+  const stepHeader = (title: string, desc: string) => (
+    <div className="space-y-2">
+      <div className="flex gap-1.5" aria-hidden="true">
+        {GUIDE_STEPS.map((name, index) => (
+          <span key={name} className={`h-1 flex-1 rounded-full ${index < guideStep ? 'bg-violet-500' : 'bg-slate-200'}`} />
+        ))}
+      </div>
+      <p className="text-[11px] font-bold text-violet-600">
+        第 {guideStep} 步，共 {GUIDE_STEPS.length} 步 · {GUIDE_STEPS[guideStep - 1]}
+      </p>
+      <h4 className="text-base font-bold text-slate-800">{title}</h4>
+      <p className="text-xs leading-relaxed text-slate-500">{desc}</p>
+    </div>
+  );
+
+  const guideContent = guideStep === 0 ? (
+    <>
+      <AmsgIntroDemo />
+      <h4 className="text-base font-bold text-slate-800 text-center">App 关着，TA 也能来找你</h4>
+      <p className="text-xs leading-relaxed text-slate-500">
+        平时角色只能在你开着页面的时候说话，App 一被杀后台就什么都收不到了。主动消息 2.0 给你装一个一直醒着的云端小后台：到了时间，它替角色把话写好，再用通知送到你手机上。
+      </p>
+      <ul className="bg-violet-50 border border-violet-100 rounded-2xl p-4 space-y-2 text-xs leading-relaxed text-slate-600">
+        <li><strong>TA 自己约时间来找你</strong>，你也可以替 TA 定好每天几点发。</li>
+        <li><strong>你很久没说话时</strong>，TA 的「离开后消息」能直接推到手机上。</li>
+        <li><strong>聊天也能交给云端</strong>：发完消息就算把 App 杀后台，回复写好了也会推给你。</li>
+      </ul>
+      {/* 数据会进用户自己的 Worker 这件事，要在动手装之前就说，不能等装完才在折叠区里看到。 */}
+      <div className="space-y-1.5 text-xs leading-relaxed text-slate-500">
+        <p><strong className="text-slate-700">要准备：</strong>一个 Cloudflare 账号（免费版就能用），两三分钟。</p>
+        <p>
+          <strong className="text-slate-700">要知道：</strong>消息内容、提示词和 API Key 会存进这个后台和它的数据库。后台装在你自己的账号里，项目没有另接中心服务器；不接受的话就不要开。
+        </p>
+      </div>
+      <button
+        type="button"
+        onClick={() => setView('panel')}
+        className="w-full text-center text-[11px] font-bold text-slate-400"
+      >
+        跳过引导，直接看全部设置
+      </button>
+    </>
+  ) : guideStep === 1 ? (
+    <>
+      {stepHeader(
+        replacementNotice ? '等待旧任务结束' : reconfigure === 'review' ? '先确认后台连接' : '装一个你自己的后端',
+        replacementNotice ? '进度已保存，新后台暂不接收任务。' : reconfigure === 'review' ? '检查地址并重新验证，再依次确认通知、即时对话和角色设置。' : '页面关着的时候，得有个一直醒着的地方替角色写消息。它装在你自己的 Cloudflare 账号里，粘一枚 Token 就能自动装好。',
+      )}
+      {isConnected && reconfigure !== 'review' && !replacementPlan ? (
+        <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-4 space-y-1">
+          <p className="font-bold text-emerald-700">后端已经连上了</p>
+          <p className="text-[11px] font-mono text-emerald-700/80 break-all">{config.workerUrl}</p>
+        </div>
+      ) : (
+        <>
+          {deployCard}
+          {/* 地址和密钥那几栏只在用得上时出现：选了手动配置，或者一键部署已经把地址填好、正在等它生效。 */}
+          {!replacementPlan && (config.workerUrl?.trim() || manualSetupOpen) ? (
+            <><div className={cardClass}>{workerBody}</div>
+              {reconfigure === 'review' && <button type="button" className="amsg-button-secondary" disabled={loading || provisioning} onClick={() => setExistingSetup(true)}>改用连接码或备份接回</button>}
+            </>
+          ) : (
+<>
+{relayToggle}
+            <button
+              type="button"
+              onClick={() => workspaceSection ? setExistingSetup(true) : setView('panel')}
+              className="w-full text-center text-[11px] font-bold text-slate-400"
+            >
+              {workspaceSection ? '已有后台／换设备' : '已经有后端地址？去全部设置里填'}
+            </button>
+</>
+          )}
+        </>
+      )}
+    </>
+  ) : guideStep === 2 ? (
+    <>
+      {stepHeader(
+        '让消息能送到手机上',
+        nativeApp ? '后端写好的消息靠系统通知送过来。连接 ntfy，并在手机系统弹窗中允许 App 发送通知。' : '后端写好的消息靠系统通知送过来。点下面的按钮，浏览器问要不要允许通知时选「允许」。',
+      )}
+      <div className={mutedCardClass}>
+        {cardHeader(pushTitle, pushStatusText, pushStatusClass)}
+        {pushBody}
+      </div>
+    </>
+  ) : guideStep === 3 ? (
+    <>
+      {stepHeader('确认即时对话总开关', '角色默认跟随这里的设置，之后可以分别调整。')}
+      <div className={mutedCardClass}>
+        {cardHeader('即时对话（防杀后台）', instantStatusText, instantStatusClass)}
+        {instantBody}
+      </div>
+    </>
+  ) : (
+    <>
+      {/* 全局配好只是「能用」，角色那边的开关不开的话一条都不会来——引导在前一步就结束的话，
+          用户会以为装坏了。所以单独占一屏，不跟别的内容挤在一起。 */}
+      {stepHeader(
+        '在每个角色那里单独打开',
+        '前面装的后端和通知是所有角色共用的，但主动消息要一个角色一个角色地开。没开的角色不会来找你。',
+      )}
+      <ol className="bg-violet-50 border border-violet-100 rounded-2xl p-4 space-y-2 text-xs leading-relaxed text-slate-600 list-decimal list-outside pl-8">
+        <li>回到和 TA 的聊天。</li>
+        <li>点输入框旁边的<strong>「+」</strong>，打开功能菜单。</li>
+        <li>找到<strong>「主动消息 2.0」</strong>，把<strong>「启用主动消息 2.0」</strong>的开关打开。</li>
+      </ol>
+      <p className="text-xs leading-relaxed text-slate-500">
+        {workspaceSection ? '完成后也可以在「功能总览」中进入各角色的配置页。' : '想让别的角色也来找你，就到那个角色的聊天里再开一次。'}即时对话可以在同一个面板里单独关闭，与主动消息排程互不影响。
+      </p>
+    </>
+  );
+
+  // ── 面板 ────────────────────────────────────────────────────────────────────
+
+  const cronPaused = cronState?.kind === 'known' && !cronState.enabled;
+  const panelTabs = [
+    { id: 'worker', label: '后端连接', attention: !isConnected || workerOutdated || workerVersion?.state === 'outdated' || cronPaused },
+    { id: 'push', label: '通知设置', attention: Boolean(pushCheckError) || nativePermissionMissing || Boolean(pushStatus && !pushStatus.hasSubscription) },
+    { id: 'instant', label: '即时对话', attention: instantChatOn && Boolean(instantChatBlockedReason) },
+    { id: 'diagnostics', label: '运行体检', attention: diagnosticLevel === 'bad' || diagnosticLevel === 'warn' },
+    { id: 'privacy', label: '数据去向' },
+    { id: 'advanced', label: '高级管理' },
+  ];
+  const globalSwitchCard = config.workerUrl?.trim() ? (
+        <div className={`rounded-2xl border px-4 py-3.5 flex items-center justify-between gap-3 ${
+          globallyEnabled ? 'bg-white border-slate-200' : 'bg-amber-50 border-amber-200'
+        }`}>
+          <div className="min-w-0">
+            <div className="text-xs font-bold text-slate-700">
+              主动消息 2.0 总开关 · {globallyEnabled ? '开启' : '已暂停'}
+            </div>
+            <p className="mt-1 text-xs leading-relaxed text-slate-500">
+              {globallyEnabled
+                ? '暂停后会立即停止本机所有 Worker 请求、后台同步与即时对话，同时尽力暂停云端定时触发，连接与角色配置原样保留。'
+                : '当前已暂停全部 Worker / 中转请求，聊天在本机直接生成。想恢复云端主动消息或修改远端配置时打开即可。'}
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={globallyEnabled}
+            aria-label="主动消息 2.0 总开关"
+            disabled={loading || provisioning}
+            onClick={() => void handleToggleMasterSwitch()}
+            className={`w-12 h-7 rounded-full transition-colors relative shrink-0 disabled:opacity-50 ${
+              globallyEnabled ? 'bg-violet-500' : 'bg-slate-300'
+            }`}
+          >
+            <span
+              className={`absolute top-0.5 left-0.5 w-6 h-6 bg-white rounded-full shadow transition-all duration-200 ${
+                globallyEnabled ? 'translate-x-5' : 'translate-x-0'
+              }`}
+            />
+          </button>
+        </div>
+      ) : null;
+  const panelContent = (
+    <>
+      {globalSwitchCard}
+      {!globallyPaused && cronPaused && <p className="text-xs leading-relaxed text-amber-700">后台任务已暂停，到点的消息先攒着，恢复后一起补发。</p>}
+      <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px]">
+        <span className={isConnected ? 'text-slate-500' : 'text-amber-700'}>后端{globallyPaused ? '已暂停' : isConnected ? '已连接' : '未连接'}</span>
+        <span className={pushStatusClass}>通知{pushStatusText}</span>
+      </div>
+      <AmsgTabBar tabs={panelTabs} selected={panelTab} onSelect={setPanelTab} label="主动消息设置分区" prefix={tabPrefix} />
+      {pushCheckError && panelTab !== 'push' && <div role="status" className="text-xs text-amber-700 space-y-2"><p>{pushCheckError}</p><button type="button" onClick={() => void refreshPushStatus(config)} className="font-semibold underline">重试推送检查</button></div>}
+      {panelTabs.map(tab => <div key={tab.id} id={`${tabPrefix}-panel-${tab.id}`} role="tabpanel" aria-labelledby={`${tabPrefix}-tab-${tab.id}`} hidden={panelTab !== tab.id} className="amsg-config-panel">
+        {panelTab === tab.id && <div className="space-y-3">
+          {tab.id === 'worker' && <>{deployCard}<h3>后端 Worker</h3>{workerBody}</>}
+          {tab.id === 'push' && <><h3>{pushTitle}</h3>{pushBody}</>}
+          {tab.id === 'instant' && <><div className="flex flex-wrap items-center justify-between gap-2"><h3>即时对话（防杀后台）</h3><span className={`text-xs ${instantStatusClass}`}>{instantStatusText}</span></div>{instantBody}</>}
+          {tab.id === 'diagnostics' && (diagnosticsCard || <p className="text-xs text-slate-500 leading-relaxed">连接后端后，可以在这里检查运行状态。</p>)}
+          {tab.id === 'privacy' && <><h3>数据存在哪儿</h3><div className="text-xs leading-relaxed text-slate-600 space-y-3">
+            <p>开了 2.0 以后，主动消息内容、提示词、相关配置，都会进入你自己部署的 Worker 及其 D1 数据库。</p>
+            <p>这是你自己的 Worker、你自己的库，项目不会额外接一个中心服务器。但只要数据进库，能碰到这台 Worker / 数据库的人（也就是你自己）就能看到这些内容。</p>
+            <p>如果你不接受把私密提示词、API Key 放进自己部署的服务，就不要开 2.0。</p>
+          </div></>}
+          {tab.id === 'advanced' && <><h3>高级信息与云端管理</h3>{advancedBody}</>}
+        </div>}
+      </div>)}
+      <p className="text-[11px] leading-relaxed text-slate-400">主动消息按角色单独开：在和 TA 的聊天里点「+」→「主动消息 2.0」。</p>
+      <button type="button" onClick={() => { setGuideStep(0); setView('guide'); }} className="w-full py-2 text-left text-[11px] font-semibold text-slate-500">这个功能是做什么的？重看介绍</button>
+    </>
+  );
+
+  const modernTabs = [
+    { id: 'connection', label: '连接与迁移' },
+    { id: 'maintenance', label: '后台地址与维护' },
+    { id: 'diagnostics', label: '运行体检' },
+    { id: 'cloud', label: '云端数据' },
+    { id: 'advanced', label: '高级维护' },
+  ];
+  const connectionContent = <div className="amsg-section-body">
+      {replacementHint && !reconfigure && !existingSetup && <div className="amsg-connect-notice">
+        <div><strong>有未完成的重新配置</strong><p>{replacementHint.scriptName}</p></div>
+        <button type="button" onClick={() => { reconfigureOrigin.current = { view, step: guideStep }; setReconfigure('backend'); }}>继续重新配置 <span aria-hidden>→</span></button>
+      </div>}
+      {reconfigure === 'choose' ? <section className="amsg-reconfigure" aria-label="重新配置向导">
+        <h4>重新配置</h4>
+        <p className="amsg-caption">选择从哪一步重新开始。</p>
+        <div className="amsg-action-list">
+          <button type="button" aria-label="保留后台，重新配置" onClick={() => { setReconfigure('review'); setVerifiedConnection(null); setGuideStep(1); setView('guide'); }}><span>保留后台，重新配置<small>逐步检查连接、通知和功能开关</small></span><span aria-hidden>→</span></button>
+          <button type="button" aria-label="后台也重新部署" onClick={() => setReconfigure('backend')}><span>后台也重新部署<small>填写 Token，换新密钥和云端数据库</small></span><span aria-hidden>→</span></button>
+        </div>
+        <p className="amsg-caption">角色、聊天和本机设置保留。进入向导不会清空数据，重新部署前还会确认。</p>
+        <button type="button" className="amsg-text-button" onClick={backWithinSettings}>取消重新配置</button>
+      </section> : reconfigure === 'backend' ? <>
+        <AmsgConnectionTransfer key="reconfigure-backend" config={config} onApply={handleRestoreConnection} receive intent="redeploy" initialScriptName={replacementHint?.scriptName} onRedeploy={handleRedeploy} active={isOpen && !covered && connectionVisible} />
+        <button type="button" className="amsg-text-button" onClick={backWithinSettings}>返回重新配置选项</button>
+      </> : existingSetup ? <>
+        <AmsgConnectionTransfer config={config} onApply={handleRestoreConnection} receive initialToken={cfToken} discoveryRequest={discoveryRequest} onDiscoveryStarted={() => setDiscoveryRequest(null)} onRestoreBackup={onRestoreBackup} onRedeploy={handleRedeploy} active={isOpen && !covered && connectionVisible} />
+        {relayToggle}
+        <button type="button" className="amsg-text-button" onClick={() => setExistingSetup(false)}>返回连接选项</button>
+      </> : !isConnected && guideStep === 0 ? <>
+        <div className="amsg-page-heading"><p>首次使用，或在新设备上接回已有配置。</p></div>
+        <div className="amsg-start-options">
+          <button type="button" onClick={() => { setGuideStep(1); setView('guide'); }}><span className="amsg-option-number">01</span><span><strong>第一次使用</strong><small>准备 Cloudflare Token，一键配置</small></span><span aria-hidden>↗</span></button>
+          <button type="button" onClick={() => setExistingSetup(true)}><span className="amsg-option-number">02</span><span><strong>已有后台／换设备</strong><small>连接码接入，或用 Token 查找部署</small></span><span aria-hidden>→</span></button>
+        </div>
+        <div className="amsg-setup-note"><h4>配置前了解一下</h4><p>后台部署在你自己的 Cloudflare 账号里，保存主动消息所需的上下文和 API Key。角色到点生成消息，App 关着也能通过通知收到。</p><p>已导入备份却没有连接？请确认备份包含后端连接，且恢复时选择了恢复连接。</p></div>
+      </> : view === 'guide' ? guideContent : <>
+        <div className="amsg-page-heading"><span className="amsg-connection-state"><i />{isConnected ? '已保存后台连接' : '等待连接验证'}</span><p className="amsg-endpoint">{config.workerUrl}</p></div>
+        <div className="amsg-next-action"><div><strong>这台设备的通知</strong><p>{pushStatusText}</p></div><button type="button" onClick={onOpenPushStatus}>查看<span aria-hidden> →</span></button></div>
+        <AmsgConnectionTransfer config={config} onApply={handleRestoreConnection} onRestoreBackup={onRestoreBackup} onRedeploy={handleRedeploy} active={isOpen && !covered && connectionVisible} />
+        <p className="amsg-caption">连接成功后，到「功能总览」分别配置角色；聊天里的「+ → 主动消息 2.0」也能进入同一份设置。</p>
+      </>}
+      {!reconfigure && !existingSetup && <div className="amsg-action-list amsg-reconfigure-entry">
+        <button type="button" aria-label="重新配置" disabled={loading || provisioning} onClick={() => { reconfigureOrigin.current = { view, step: guideStep }; setReconfigure('choose'); }}><span>重新配置<small>配置出了问题，或想从头开始</small></span><span aria-hidden>→</span></button>
+      </div>}
+      <section className="amsg-backup-note" aria-label="数据与备份说明">
+        <h4>数据与备份说明</h4>
+        <div className="space-y-4">
+          <section className="space-y-3"><h5>数据在你自己的账号里</h5><p>主动消息的上下文、提示词与 API Key 会进入你部署的 Worker 及其 D1 数据库。项目不额外接入中心消息服务器。</p></section>
+          <section className="space-y-3"><h5>个人换机备份</h5><p>个人云端备份会自动带上 2.0 的地址、密钥、原用户身份和设置。使用文件换机时，在「备份与恢复」勾选「导出文件包含主动消息 2.0 的后端连接」。恢复时同意恢复连接，再为新设备开启通知。</p><p>只转移后台连接，可在本页生成连接码。连接码不包含角色和聊天记录。</p></section>
+          <section className="space-y-3"><h5>分享备份时</h5><p>连接码和包含后端连接的备份，都能用于访问你的后台，请仅保存在自己的设备上。分享给别人的备份请不要勾选后端连接。</p><p>「迁入独立用户」保留目的地后台，不接续来源任务。</p></section>
+        </div>
+      </section>
+    </div>;
+  const workspaceContent = <>
+    <div hidden={workspaceSection !== 'overview'} className="amsg-section-body">
+      <AmsgVisitedPanel active={isOpen && workspaceSection === 'overview'}>
+      <AmsgConnectionGate connected={isConnected} onConnect={() => onSelectWorkspace?.('config')}>
+        <AmsgOverview connected={isConnected} active={isOpen && !covered && workspaceSection === 'overview'} enabled={globallyEnabled} instantEnabled={instantChatOn} busy={loading || provisioning} instantBlockedReason={instantChatBlockedReason}
+          characters={characters} characterGroups={characterGroups} onConfigureCharacter={isConnected ? onConfigureCharacter : undefined} onToggleEnabled={() => void handleToggleMasterSwitch()} onToggleInstant={() => void handleToggleInstantChat()} />
+      </AmsgConnectionGate>
+      </AmsgVisitedPanel>
+    </div>
+    <div hidden={workspaceSection !== 'push'} className="amsg-section-body">
+      <AmsgVisitedPanel active={isOpen && workspaceSection === 'push'}>
+      <AmsgConnectionGate connected={isConnected} onConnect={() => onSelectWorkspace?.('config')}>
+      <p className="amsg-caption">选择接收方案，检查设备通知。</p>
+      <div className="amsg-notification-controls space-y-4">{pushBody}</div>
+      {workspaceSection === 'push' && <section className="amsg-device-card"><h4><AmsgIcon name="device" />设备与状态</h4><PushSubscriptionPanel workspace active={!covered && isConnected} addToast={addToast} testResult={testPushResult} />
+        <details className="amsg-faq"><summary><AmsgIcon name="info" />常见问题</summary><div><h5>显示已连接，为什么没弹通知？</h5><p>先点「发送测试通知」并查看手机通知栏。连接状态只说明配置情况，系统权限、后台运行限制和网络也会影响通知显示。</p><h5>换设备后，旧设备还会收到吗？</h5><p>同一个身份只登记一个接收位置，后登记的设备会替换之前的。需要切回来时，在原设备重新连接通知即可。</p></div></details>
+      </section>}
+      </AmsgConnectionGate>
+      </AmsgVisitedPanel>
+    </div>
+    <div hidden={workspaceSection !== 'features' && workspaceSection !== 'config'} className="amsg-section-body">
+      <AmsgVisitedPanel active={isOpen && (workspaceSection === 'features' || workspaceSection === 'config')}>
+      <AmsgTabBar tabs={modernTabs} selected={featureTab} onSelect={setFeatureTab} label="功能设置分区" prefix={`${tabPrefix}-features`} />
+      {modernTabs.map(tab => <div key={tab.id} role="tabpanel" id={`${tabPrefix}-features-panel-${tab.id}`} aria-labelledby={`${tabPrefix}-features-tab-${tab.id}`} hidden={featureTab !== tab.id} className="amsg-feature-content space-y-4">
+        <AmsgVisitedPanel active={isOpen && (workspaceSection === 'features' || workspaceSection === 'config') && featureTab === tab.id}>
+        {tab.id === 'connection' && connectionContent}
+        {tab.id === 'maintenance' && <AmsgConnectionGate
+          // Keep an existing connection editable while its address is being replaced.
+          connected={isConnected || Boolean(config.initializedAt && savedWorkerUrlRef.current.trim())}
+          onConnect={() => setFeatureTab('connection')}
+          description="连接后即可修改后台地址、验证连接和更新后台。"
+        >
+          <p className="amsg-caption">使用自己的域名时，在这里替换后台地址；当前身份和云端数据会保留。</p>
+          <div className="space-y-4">{workerBody}</div>
+        </AmsgConnectionGate>}
+        {tab.id === 'diagnostics' && (diagnosticsCard || <p>连接后台后，可以在这里检查运行状态。</p>)}
+        {tab.id === 'cloud' && <><h4>云端保存了什么</h4><p>查看实际保存的任务、角色上下文、凭据和结果，也可以按项清理。本机没有的角色也会显示。</p><button type="button" className="amsg-button-primary" onClick={onOpenCloudData}>打开云端数据管理</button></>}
+        {tab.id === 'advanced' && <><p>一键部署已经处理好推送凭据，日常使用无需填写。只有手动部署或排查网页推送时才需要打开。</p><button type="button" className="amsg-button-secondary" onClick={onOpenVapid}>推送凭据（VAPID）</button>{advancedBody}</>}
+        </AmsgVisitedPanel>
+      </div>)}
+      </AmsgVisitedPanel>
+    </div>
+  </>;
+  const inGuide = view === 'guide' && reconfigure !== 'choose' && reconfigure !== 'backend' && (!workspaceSection || (connectionVisible && !existingSetup && guideStep > 0));
+  const closeButton = (
+    <button
+      onClick={onClose}
+      className="flex-1 py-3 bg-slate-100 text-slate-500 font-bold rounded-2xl active:scale-95 transition-transform"
+    >
+      返回设置
+    </button>
+  );
+
+  return (
+    <>
+    <SettingsDetailPage
+      isOpen={isOpen}
+      hidden={covered || pauseConfirmOpen || relayConfirmOpen}
+      title={workspaceSection ? '' : '主动消息设置'}
+      onClose={onClose}
+      footer={!inGuide ? undefined : (
+        <>
+          {guideStep === 0 ? closeButton : (
+            <button
+              onClick={backWithinSettings}
+              disabled={loading || provisioning}
+              className="flex-1 py-3 bg-slate-100 text-slate-500 font-bold rounded-2xl active:scale-95 transition-transform"
+            >
+              上一步
+            </button>
+          )}
+          {/* 第 1 步没连上就不放行：后面几步都要问这台后端，跳过去只会看到一排开不了的开关。 */}
+          <button
+            onClick={() => {
+              if (guideStep < GUIDE_STEPS.length) setGuideStep(step => step + 1);
+              else { setView('panel'); setReconfigure(null); reconfigureOrigin.current = null; setGuideStep(0); onSelectWorkspace?.('overview'); }
+            }}
+            disabled={loading || provisioning || (guideStep === 1 && !canContinueConnection)}
+            className="flex-1 py-3 bg-violet-500 text-white font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-40"
+          >
+            {guideStep === 0 ? '开始配置'
+              : guideStep === 1 ? (canContinueConnection ? '下一步' : reconfigure === 'review' ? '验证后继续' : '装好后继续')
+              : guideStep === 2 ? (pushStatus?.hasSubscription ? '下一步' : '先跳过')
+              : guideStep === 3 ? '下一步'
+              : '完成'}
+          </button>
+        </>
+      )}
+    >
+      <div ref={topRef} className={`space-y-4 text-sm text-slate-600 ${workspaceSection ? 'amsg-modern-content' : ''}`}>
+        {configLoadError ? (
+          <div role="alert" className="bg-amber-50 border border-amber-200 rounded-2xl px-4 py-3 text-xs text-amber-700 space-y-2">
+            <p>{configLoadError}</p>
+            <button type="button" onClick={() => void refresh().catch(() => {})} className="font-bold underline">
+              重试读取配置
+            </button>
+          </div>
+        ) : null}
+        {workspaceSection ? workspaceContent : inGuide ? guideContent : panelContent}
+      </div>
+    </SettingsDetailPage>
+    {/* 最终确认独立于配置子页，返回优先取消确认。 */}
+    <ConfirmDialog
+      isOpen={pauseConfirmOpen}
+      title="暂停后台任务"
+      message="暂停后，到点的主动消息和定时消息会先攒着，不会丢。点「恢复后台任务」之后，攒下的会一起补发。"
+      confirmText="暂停"
+      variant="warning"
+      onConfirm={() => void applyCronTrigger(false)}
+      onCancel={() => setPauseConfirmOpen(false)}
+    />
+    {/* 中转要在中间解开 TLS 才能转发，打开前强制读 5 秒，确认后才存盘 */}
+    <ConfirmDialog
+      isOpen={relayConfirmOpen}
+      title="打开大陆连接优化前请读完"
+      message={(
+        // 共用弹窗的正文默认是小号浅灰字；这份提醒要逐条读完，字号、颜色都提一档，重点加粗
+        <ul className="list-disc pl-4 space-y-2.5 text-[15px] leading-relaxed font-medium text-slate-700">
+          <li>请求会先到<strong className="font-bold text-slate-900">维护者在美国的中转服务器</strong>，再转给你的 Worker。</li>
+          <li>中转要在中间解开加密，<strong className="font-bold text-slate-900">技术上看得到经过的全部内容</strong>：聊天消息、提示词、API Key 和后端密钥。中转<strong className="font-bold text-slate-900">不保存这些内容</strong>，也不会把你的 IP 转给 Worker。</li>
+          <li>要先在 SullyOS 的 Discord 群里，用<strong className="font-bold text-slate-900">已验证的账号</strong>发 /中转令牌 领一个令牌。中转<strong className="font-bold text-slate-900">只按账号、按天记流量和请求次数</strong>，保存 90 天，你随时能查。令牌 30 天不用会失效，也可以随时重领。</li>
+          <li>这是<strong className="font-bold text-slate-900">维护者自费搭的</strong>，不保证一直能用，但会尽力维护。连不上的时候，关掉开关就恢复直连。</li>
+          <li className="text-red-600 marker:text-red-600"><strong className="font-bold">中转只允许正常主动消息使用。恶意滥用 Worker 会被禁止使用中转，严重的会被移出社区！</strong></li>
+          <li>介意的话请别打开，可以看 Worker 地址下面的直连教程。</li>
+        </ul>
+      )}
+      confirmText="我已了解，打开"
+      cancelText="先不开"
+      variant="warning"
+      confirmDelaySeconds={5}
+      onConfirm={() => {
+        setRelayConfirmOpen(false);
+        void saveRelay(true);
+      }}
+      onCancel={() => setRelayConfirmOpen(false)}
+    />
+    </>
+  );
+};
+
+export default React.memo(ActiveMsgGlobalSettingsModal);

@@ -1,0 +1,685 @@
+
+
+
+<!DOCTYPE html>
+<html lang="zh-CN" translate="no">
+  <head>
+    <script data-sully-build="mwn3pzaw-unknown">Object.assign(globalThis,{"__APP_BUILD_ID__":"mwn3pzaw-unknown","__BUILD_BRANCH__":"unknown","__BUILD_COMMIT__":"unknown","__BUILD_TIME__":"2026-11-19 13:20:17 UTC+8"});</script>
+
+    <script data-base="/" data-build="mwn3pzaw-unknown">/* Runs before application modules. Only bounded, local failure diagnostics are saved. */
+(function () {
+  'use strict';
+  var script = document.currentScript;
+  var standalone = script && script.getAttribute('data-mode') === 'recovery';
+  var base = new URL((script && script.getAttribute('data-base')) || './', document.baseURI);
+  var build = (script && script.getAttribute('data-build')) || 'recovery';
+  var panel, status, detail, updateButton, observer, lastError = '', busy = false;
+  var timer = 0, poll = 0, stopUpdate = null;
+  var startedAt = Date.now(), session = startedAt.toString(36) + '-' + Math.random().toString(36).slice(2);
+  var prefix = 'sully_startup_diagnostics_v1_', saveTimer = 0, dirty = false, storageUnavailable = false;
+  var trace = { at: startedAt, build: build, events: [], mountedAfterFailure: false };
+  var kinds = ['script-load', 'module-load', 'unexpected-eof', 'script-syntax', 'module-init-order', 'blob-store-init', 'missing-global', 'runtime-error', 'unhandled-rejection', 'startup-waiting'];
+  // Persist fixed categories, never arbitrary exception text, API URLs or page query strings.
+  function errorKind(text, fallback) {
+    if (/Unexpected EOF|Unexpected end of (?:input|script)/i.test(text)) return 'unexpected-eof';
+    if (/Failed to fetch dynamically imported module|Importing a module script failed|error loading dynamically imported module/i.test(text)) return 'module-load';
+    if (/before initialization|Cannot access uninitialized variable/i.test(text)) return 'module-init-order';
+    if (/createBlobStore: prefix must be a non-empty string/.test(text)) return 'blob-store-init';
+    if (/SyntaxError|Unexpected token|Invalid or unexpected token/i.test(text)) return 'script-syntax';
+    if (/is not defined|Can't find variable/i.test(text)) return 'missing-global';
+    return fallback;
+  }
+  function resourcePath(value) {
+    try {
+      var url = new URL(value, base);
+      if (url.origin !== base.origin || url.pathname.indexOf(base.pathname) !== 0) return '';
+      var path = url.pathname.slice(base.pathname.length);
+      return /^(?:assets\/build\/[a-zA-Z0-9_.-]+\.(?:js|css)|vendor\/tailwind-3\.4\.17\.js)$/.test(path) ? path : '';
+    } catch (_) { return ''; }
+  }
+  function decode(value) {
+    if (!value || !Number.isSafeInteger(value.at) || value.at < 0 || value.at > 8640000000000000 ||
+        typeof value.build !== 'string' || !/^[a-zA-Z0-9_.-]{1,160}$/.test(value.build) || !Array.isArray(value.events)) return null;
+    var events = value.events.slice(0, 8).filter(function (event) {
+      return event && kinds.indexOf(event.kind) !== -1 && Number.isSafeInteger(event.elapsedMs) && event.elapsedMs >= 0;
+    }).map(function (event) {
+      return { kind: event.kind, elapsedMs: event.elapsedMs, online: event.online === true,
+        controlled: event.controlled === true, resource: resourcePath(event.resource || ''),
+        line: Number.isSafeInteger(event.line) && event.line >= 0 ? event.line : 0 };
+    });
+    return events.length ? { at: value.at, build: value.build, events: events, mountedAfterFailure: value.mountedAfterFailure === true } : null;
+  }
+  function savedSessions() {
+    var records = [];
+    try {
+      var storage = window.localStorage;
+      for (var i = 0; i < storage.length; i++) {
+        var key = storage.key(i);
+        if (!key || key.indexOf(prefix) !== 0) continue;
+        try {
+          var raw = storage.getItem(key);
+          var value = raw && raw.length <= 12000 ? decode(JSON.parse(raw)) : null;
+          records.push({ key: key, value: value });
+        } catch (_) { records.push({ key: key, value: null }); }
+      }
+    } catch (_) { storageUnavailable = true; }
+    return records.sort(function (a, b) { return (b.value ? b.value.at : 0) - (a.value ? a.value.at : 0); });
+  }
+  function saveTrace() {
+    clearTimeout(saveTimer); saveTimer = 0;
+    if (!dirty || !trace.events.length) return;
+    try {
+      var storage = window.localStorage, ownKey = prefix + session;
+      // Each page owns a key so two failing tabs do not overwrite each other.
+      savedSessions().filter(function (record) { return record.key !== ownKey; }).slice(7).forEach(function (record) {
+        storage.removeItem(record.key);
+      });
+      storage.setItem(ownKey, JSON.stringify(trace)); dirty = false;
+    } catch (_) { storageUnavailable = true; /* In-memory diagnostics remain copyable. */ }
+  }
+  function scheduleSave() {
+    dirty = true;
+    if (!saveTimer) saveTimer = setTimeout(saveTrace, 1000);
+  }
+  function record(kind, resource, line) {
+    if (standalone || trace.events.length >= 8) return;
+    resource = resourcePath(resource || '');
+    if (trace.events.some(function (event) { return event.kind === kind && event.resource === resource && event.line === (line || 0); })) return;
+    var controlled = false;
+    try { controlled = !!(navigator.serviceWorker && navigator.serviceWorker.controller); } catch (_) {}
+    trace.events.push({ kind: kind, elapsedMs: Math.max(0, Date.now() - startedAt), online: navigator.onLine !== false,
+      controlled: controlled, resource: resource, line: line || 0 });
+    scheduleSave();
+  }
+  function historyReport() {
+    var history = savedSessions().filter(function (record) { return record.key !== prefix + session && record.value; })
+      .map(function (record) { return record.value; });
+    if (trace.events.length) history.unshift(trace);
+    var lines = history.slice(0, 8).map(function (record) {
+      return new Date(record.at).toISOString() + ' build ' + record.build +
+        (record.mountedAfterFailure ? '（同页随后挂载；不代表全部功能正常）' : '（未记录到同页挂载）') + '\n' +
+        record.events.map(function (event) {
+          return '  +' + event.elapsedMs + 'ms ' + event.kind + ' ' + (event.online ? '在线' : '离线') +
+            ' SW=' + (event.controlled ? '控制中' : '未控制') + (event.resource ? ' ' + event.resource + ':' + event.line : '');
+        }).join('\n');
+    });
+    return '\n\n最近启动异常（本机时间，UTC；最多 8 次）\n' + (lines.join('\n') || '暂无记录；旧版本的故障无法补记。') +
+      '\n历史仅保留错误类别和静态文件位置，不保存异常全文、不自动上传。' +
+      (storageUnavailable ? '\n本页无法访问或写入本地诊断存储，刷新后可能无法保留。' : '');
+  }
+  window.__sullyStartupDiagnosticReport = diagnostics;
+  window.addEventListener('pagehide', saveTrace);
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') saveTrace(); });
+  function blank() {
+    var root = document.getElementById('root');
+    return standalone || !root || root.childElementCount === 0;
+  }
+  function hideIfReady() {
+    if (blank()) return false;
+    if (trace.events.length && !trace.mountedAfterFailure) { trace.mountedAfterFailure = true; scheduleSave(); }
+    if (panel) { panel.remove(); panel = null; }
+    clearTimeout(timer);
+    if (observer) observer.disconnect();
+    if (stopUpdate) stopUpdate();
+    return true;
+  }
+  function message(text) { if (status) status.textContent = text; }
+  function diagnostics() {
+    return 'SullyOS 启动诊断\n构建：' + build + '\n页面：' + location.origin + location.pathname +
+      '\n浏览器：' + navigator.userAgent + '\n网络：' + (navigator.onLine === false ? '离线' : '在线') +
+      '\n本页报错：' + (lastError || (blank() ? '暂未捕获到错误' : '未捕获到启动错误，页面已有内容')) + historyReport();
+  }
+  function refreshDetail() { if (detail) detail.value = diagnostics(); }
+  function navigate() {
+    if (hideIfReady()) return;
+    if (stopUpdate) stopUpdate();
+    saveTrace();
+    if (standalone) location.replace(base.href);
+    else location.reload();
+  }
+  function update() {
+    if (busy) return;
+    if (!navigator.serviceWorker) { message('当前浏览器无法使用网页更新服务，请先尝试重新打开；仍失败时复制诊断反馈。'); return; }
+    clearTimeout(timer);
+    busy = true; updateButton.disabled = true; message('正在检查网页更新，聊天与存档不会被删除…');
+    var active = true, registration, approved, preparing, prepared, channel;
+    function stopped() {
+      active = false; busy = false; clearTimeout(timer); clearInterval(poll);
+      if (channel) { channel.port1.close(); channel.port2.close(); channel = null; }
+      navigator.serviceWorker.removeEventListener('controllerchange', changed);
+      if (updateButton) updateButton.disabled = false;
+      stopUpdate = null;
+    }
+    function fail() {
+      if (!active) return;
+      stopped(); message('更新尚未完成。请检查网络后重试；也可以关闭这个站点的其他标签页和桌面入口，再重新打开。');
+    }
+    function changed() {
+      if (active && approved && navigator.serviceWorker.controller === approved) navigate();
+    }
+    function prepare(worker) {
+      if (preparing || !active) return;
+      if (!worker) { fail(); return; }
+      preparing = worker;
+      message('正在校验并补齐启动资源，完成后重新打开；已下好的文件会保留…');
+      try {
+        channel = new MessageChannel();
+        channel.port1.onmessage = function (event) {
+          if (!active) return;
+          channel.port1.close(); channel.port2.close(); channel = null;
+          preparing = null;
+          if (!event.data || event.data.error || event.data.offlineReady !== true) { fail(); return; }
+          prepared = worker;
+          inspect();
+        };
+        // Also runs when this is already the latest worker. A module that never
+        // mounted cannot reach the application's normal background cache preparation.
+        worker.postMessage({type:'SULLY_CACHE_PREPARE'}, [channel.port2]);
+      } catch (_) { fail(); }
+    }
+    function inspect() {
+      if (!active || hideIfReady()) return;
+      if (registration.waiting) {
+        if (approved === registration.waiting) return;
+        if (prepared !== registration.waiting) { prepare(registration.waiting); return; }
+        approved = registration.waiting; message('新版已准备好，正在重新打开…');
+        try { approved.postMessage({type:'SULLY_ACTIVATE_UPDATE'}); } catch (_) { fail(); }
+      } else if (registration.installing) message('正在下载新版启动资源，请保持页面打开…');
+      else if (!approved || approved.state === 'activated') {
+        if (!registration.active) { fail(); return; }
+        if (prepared !== registration.active) { prepare(registration.active); return; }
+        navigate();
+      }
+    }
+    stopUpdate = stopped;
+    navigator.serviceWorker.addEventListener('controllerchange', changed);
+    timer = setTimeout(fail, 120000);
+    navigator.serviceWorker.getRegistration(base.href).then(function (existing) {
+      if (!active) return null;
+      // Preserve this registration and its push subscription. Never unregister it.
+      return existing || navigator.serviceWorker.register(new URL('sw-keep-alive.js', base).href, {scope:base.href, updateViaCache:'none'});
+    }).then(function (value) {
+      if (!active || !value) return;
+      if (new URL(value.scope).href !== base.href) throw new Error('Unexpected service worker scope');
+      registration = value;
+      return registration.update().then(function () {
+        if (!active) return;
+        poll = setInterval(inspect, 500); inspect();
+      });
+    }).catch(fail);
+  }
+  function show() {
+    if (hideIfReady()) return;
+    if (!lastError) record('startup-waiting');
+    if (panel) { refreshDetail(); return; }
+    panel = document.createElement('section'); panel.id = 'sully-startup-recovery';
+    panel.setAttribute('role', 'alert');
+    panel.style.cssText = 'position:fixed;inset:0;z-index:2147483647;overflow:auto;background:#f8f3ec;color:#473b34;padding:calc(32px + env(safe-area-inset-top,0px)) 24px 32px;box-sizing:border-box;font:15px/1.7 system-ui,sans-serif;text-align:left';
+    var card = document.createElement('div'); card.style.cssText = 'max-width:480px;margin:8vh auto'; panel.appendChild(card);
+    var title = document.createElement('h1'); title.textContent = standalone ? '网页启动修复' : lastError ? '启动遇到问题' : '启动尚未完成';
+    title.style.cssText = 'font-size:24px;font-weight:600;margin:0 0 16px'; card.appendChild(title);
+    status = document.createElement('p'); status.textContent = '可以检查网页更新后重试，不会清除聊天或存档。最近的启动异常会自动保留在本机；恢复后也可在设置底部复制，不会自动上传。'; card.appendChild(status);
+    function button(label, action) {
+      var el = document.createElement('button'); el.type = 'button'; el.textContent = label;
+      el.style.cssText = 'font:inherit;border:1px solid #bca895;border-radius:12px;padding:10px 16px;background:#fffaf4;color:#473b34;margin:8px 8px 8px 0;cursor:pointer';
+      el.onclick = action; card.appendChild(el); return el;
+    }
+    updateButton = button('检查更新并重试', update);
+    button('重新打开', navigate);
+    var details = document.createElement('details'), summary = document.createElement('summary');
+    summary.textContent = '启动诊断（可复制给开发者）'; details.appendChild(summary);
+    detail = document.createElement('textarea'); detail.readOnly = true; detail.setAttribute('aria-label','启动诊断');
+    detail.style.cssText = 'box-sizing:border-box;width:100%;height:180px;margin:12px 0;padding:12px;font:12px/1.6 monospace;color:#473b34;background:white;border:1px solid #d8cbbd;border-radius:8px;user-select:text';
+    details.appendChild(detail); card.appendChild(details); refreshDetail();
+    button('复制启动诊断', function () {
+      details.open = true; refreshDetail(); detail.focus(); detail.select();
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(detail.value).then(function () { message('启动诊断已复制，可粘贴给开发者。'); }, function () { message('请长按诊断文字复制。'); });
+      else message('请长按诊断文字复制。');
+    });
+    (document.body || document.documentElement).appendChild(panel);
+  }
+  function capture(text, kind, resource, line) {
+    if (!blank()) return;
+    text = String(text || '启动资源加载失败').slice(0, 3000);
+    // Keep the first error: a later "tailwind is not defined" must not hide its failed download.
+    if (!lastError) lastError = text;
+    var category = errorKind(text, kind);
+    if (!resource && category === 'module-load') {
+      var match = text.match(/https?:\/\/[^\s'"<>]+/);
+      if (match) resource = match[0];
+    }
+    record(category, resource, line);
+    setTimeout(show, 0);
+  }
+  window.addEventListener('error', function (event) {
+    var target = event.target;
+    if (event.message) capture(event.message + (event.filename ? '\n' + event.filename.split('?')[0] + ':' + event.lineno : ''), 'runtime-error', event.filename, event.lineno);
+    else if (target && target.tagName === 'SCRIPT') capture('启动脚本加载失败：' + (target.src || '').split('?')[0], 'script-load', target.src);
+  }, true);
+  window.addEventListener('unhandledrejection', function (event) { capture(event.reason && event.reason.message || event.reason, 'unhandled-rejection'); });
+  function watchRoot() {
+    if (hideIfReady()) return;
+    var root = document.getElementById('root');
+    if (root && window.MutationObserver) { observer = new MutationObserver(hideIfReady); observer.observe(root, {childList:true}); }
+    if (standalone) show();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', watchRoot, {once:true});
+  else watchRoot();
+  timer = setTimeout(show, standalone ? 0 : 12000);
+}());
+</script>
+    <script>/* Inlined into HTML: the handover screen survives a full module/environment reload. */
+(function () {
+  var key = 'sully_space_transition_v1', node, timer, removal, arriving = null;
+  var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function clear() {
+    clearTimeout(timer); clearTimeout(removal);
+    if (node) node.remove();
+    node = null;
+    try { window.sessionStorage.removeItem(key); } catch (_) {}
+  }
+  function show(name, entering) {
+    clear();
+    if (!document.getElementById('sully-space-transition-style')) {
+      var style = document.createElement('style');
+      style.id = 'sully-space-transition-style';
+      style.textContent = '#sully-space-transition{position:fixed;inset:0;z-index:2147483000;display:grid;place-items:center;background:#f5f3f8;color:#423c50;font-family:system-ui,sans-serif;text-align:center;transition:opacity .36s ease;isolation:isolate}' +
+        '#sully-space-transition:before{content:"";position:absolute;inset:0;z-index:-1;background:radial-gradient(ellipse at 50% 44%,#e9dff5 0,transparent 56%)}' +
+        '#sully-space-transition .space-mark{width:76px;height:76px;margin:0 auto 24px;border-radius:26px;display:grid;place-items:center;background:#ffffffb8;border:1px solid #fff;font-size:28px;box-shadow:0 12px 40px #6f548914}' +
+        '#sully-space-transition .space-name{font-size:22px;font-weight:500;max-width:80vw;overflow-wrap:anywhere;margin:0}' +
+        '#sully-space-transition .space-caption{font-size:12px;letter-spacing:.12em;color:#91869e;margin-top:12px}' +
+        '#sully-space-transition .space-line{width:36px;height:2px;background:#b6a0d0;margin:28px auto 0;border-radius:2px;animation:space-breathe 1.8s ease-in-out infinite}' +
+        '@keyframes space-breathe{50%{opacity:.35;transform:scaleX(.6)}}' +
+        '@keyframes space-cover{from{opacity:0}to{opacity:1}}' +
+        '@media(prefers-reduced-motion:reduce){#sully-space-transition{transition:none!important;animation:none!important}#sully-space-transition .space-line{animation:none}}';
+      document.head.appendChild(style);
+    }
+    node = document.createElement('div'); node.id = 'sully-space-transition';
+    node.setAttribute('role', 'status'); node.setAttribute('aria-live', 'polite');
+    var content = document.createElement('div'), mark = document.createElement('div'), title = document.createElement('p'), caption = document.createElement('p'), line = document.createElement('div');
+    mark.className = 'space-mark'; mark.textContent = Array.from(name)[0] || 'U'; mark.setAttribute('aria-hidden', 'true');
+    title.className = 'space-name'; title.textContent = name;
+    caption.className = 'space-caption'; caption.textContent = '正在进入你的空间';
+    line.className = 'space-line'; line.setAttribute('aria-hidden', 'true');
+    content.append(mark, title, caption, line); node.appendChild(content);
+    if (entering && !reduced) node.style.animation = 'space-cover .28s ease both';
+    document.documentElement.appendChild(node);
+    // Never conceal startup recovery, a failed database, or a stalled navigation indefinitely.
+    timer = setTimeout(clear, 12000);
+  }
+  try {
+    var saved = JSON.parse(window.sessionStorage.getItem(key) || 'null');
+    window.sessionStorage.removeItem(key);
+    if (saved && typeof saved.name === 'string' && saved.name.length <= 120 &&
+        typeof saved.at === 'number' && Date.now() - saved.at >= 0 && Date.now() - saved.at < 30000 &&
+        saved.id === (window.localStorage.getItem('sully_active_user_space_v1') || 'default')) {
+      arriving = saved.id; show(saved.name, false);
+    }
+  } catch (_) {}
+  window.__sullySpaceTransition = {
+    arriving: function (id) { return arriving === id; },
+    begin: function (id, name) {
+      show(name.slice(0, 120), true);
+      try { window.sessionStorage.setItem(key, JSON.stringify({ id: id, name: name.slice(0, 120), at: Date.now() })); } catch (_) {}
+      return new Promise(function (resolve) { setTimeout(resolve, reduced ? 0 : 280); });
+    },
+    finish: function () {
+      if (!node || node.dataset.leaving) return;
+      node.dataset.leaving = 'true';
+      // The target has committed its desktop; allow a paint before lifting the cover.
+      removal = setTimeout(function () {
+        if (node) { node.style.opacity = '0'; node.style.pointerEvents = 'none'; }
+        removal = setTimeout(clear, reduced ? 0 : 360);
+      }, reduced ? 0 : 100);
+    },
+    cancel: clear
+  };
+  window.addEventListener('error', function (event) { if (event.target === window) clear(); });
+  window.addEventListener('pageshow', function (event) { if (event.persisted) clear(); });
+})();
+</script>
+
+    <meta charset="utf-8" />
+    <!-- 保留正常访问；请求搜索引擎不收录本站。不要用 robots.txt 阻止爬虫读取此声明。 -->
+    <meta name="robots" content="noindex" />
+    <!-- 关掉浏览器自动翻译：SullyOS 本身就是中文 App，翻译纯属添乱（甚至「中译中」），
+         还会改动 React 托管的 DOM 触发 insertBefore/removeChild 白屏。translate="no" + 这两个 meta
+         覆盖 Chrome/Edge/三星 等主流浏览器。utils/translateCrashGuard 作为兜底护栏仍保留。 -->
+    <meta name="google" content="notranslate" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0, viewport-fit=cover, interactive-widget=resizes-content" />
+    <meta name="application-name" content="SullyOS·糯米机" />
+    <title>SullyOS·糯米机</title>
+    
+    <!-- PWA Settings -->
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <meta name="theme-color" content="#0f1115" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="SullyOS·糯米机" />
+    
+    <!-- Updated Icons -->
+    <link rel="icon" type="image/png" href="./icons/jellyfish-192.png?v=38b1adde1d" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./icons/jellyfish-180.png?v=38b1adde1d" />
+
+    <!-- KaTeX CSS for Math Rendering -->
+    <link rel="stylesheet" href="https://unpkg.com/katex@0.16.9/dist/katex.min.css" integrity="sha384-n8MVd4RsNIU0tAv4ct0nTaAbDJwPJzDEaqSD1odI+WdtXRGWt2kTvGFasHpSy3SV" crossorigin="anonymous" media="print" onload="this.media='all'">
+
+    <script src="/vendor/tailwind-3.4.17.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300;400;500;600&family=Nunito:wght@400;500;600;700;800;900&family=Noto+Sans+SC:wght@400;500;700;900&family=DM+Serif+Display:ital@0;1&family=Caveat:wght@400;500;600;700&family=Shippori+Mincho:wght@400;500;600;700&family=Courier+Prime:ital,wght@0,400;0,700;1,400&family=Ma+Shan+Zheng&family=Long+Cang&family=ZCOOL+KuaiLe&family=ZCOOL+XiaoWei&display=swap" rel="stylesheet" crossorigin="anonymous" media="print" onload="this.media='all'">
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            fontFamily: {
+              sans: ['var(--app-font)', 'sans-serif'],
+            },
+            colors: {
+              primary: 'hsl(var(--primary-hue), var(--primary-sat), var(--primary-lightness))', 
+              'primary-focus': 'hsl(var(--primary-hue), var(--primary-sat), calc(var(--primary-lightness) - 10%))',
+              'primary-light': 'hsl(var(--primary-hue), var(--primary-sat), 92%)',
+              surface: 'rgba(255, 255, 255, 0.75)',
+              'surface-glass': 'rgba(255, 255, 255, 0.35)',
+            },
+            opacity: Object.fromEntries(Array.from({ length: 101 }, (_, i) => [i, (i / 100).toString()])),
+            animation: {
+              'fade-in': 'fadeIn 0.35s cubic-bezier(0.4, 0, 0.2, 1)',
+              'slide-up': 'slideUp 0.35s cubic-bezier(0.25, 1, 0.5, 1)',
+              'slide-down': 'slideDown 0.35s cubic-bezier(0.25, 1, 0.5, 1)',
+              'pop-in': 'popIn 0.35s cubic-bezier(0.175, 0.885, 0.32, 1.275)',
+              'float-up': 'floatUp 3s ease-out forwards',
+              'wiggle': 'wiggle 0.5s ease-in-out infinite',
+              'bounce-slow': 'bounceSlow 2s ease-in-out infinite',
+              'float': 'floatDrift 4s ease-in-out infinite alternate',
+              'glow-pulse': 'glowPulse 3s ease-in-out infinite',
+              'shimmer': 'shimmer 2.5s ease-in-out infinite',
+              'dot-pulse': 'dotPulse 1.2s ease-in-out infinite',
+              'app-open': 'appOpen 0.4s cubic-bezier(0.16, 1, 0.3, 1)',
+              'notif-pop': 'notifPop 0.5s cubic-bezier(0.34, 1.56, 0.64, 1)',
+            },
+            keyframes: {
+              fadeIn: {
+                '0%': { opacity: '0', transform: 'scale(0.97) translateY(4px)' },
+                '100%': { opacity: '1', transform: 'scale(1) translateY(0)' },
+              },
+              slideUp: {
+                '0%': { transform: 'translateY(100%)', opacity: '0' },
+                '100%': { transform: 'translateY(0)', opacity: '1' },
+              },
+              slideDown: {
+                '0%': { transform: 'translateY(-100%)', opacity: '0' },
+                '100%': { transform: 'translateY(0)', opacity: '1' },
+              },
+              popIn: {
+                '0%': { opacity: '0', transform: 'scale(0.5)' },
+                '60%': { transform: 'scale(1.05)' },
+                '100%': { opacity: '1', transform: 'scale(1)' },
+              },
+              floatUp: {
+                '0%': { opacity: '1', transform: 'translateY(100vh) scale(1)' },
+                '50%': { opacity: '1' },
+                '100%': { opacity: '0', transform: 'translateY(-50px) scale(1.5)' },
+              },
+              wiggle: {
+                '0%, 100%': { transform: 'translate(-50%, -100%) rotate(-3deg)' },
+                '50%': { transform: 'translate(-50%, -100%) rotate(3deg)' },
+              },
+              bounceSlow: {
+                '0%, 100%': { transform: 'translateY(0)' },
+                '50%': { transform: 'translateY(-10px)' },
+              },
+              floatDrift: {
+                '0%': { transform: 'translateY(0) scale(1)', opacity: '0.3' },
+                '100%': { transform: 'translateY(-30px) scale(1.1)', opacity: '0.6' },
+              },
+              glowPulse: {
+                '0%, 100%': { boxShadow: '0 0 15px rgba(139, 92, 246, 0.15)' },
+                '50%': { boxShadow: '0 0 25px rgba(139, 92, 246, 0.3)' },
+              },
+              shimmer: {
+                '0%': { backgroundPosition: '-200% 0' },
+                '100%': { backgroundPosition: '200% 0' },
+              },
+              dotPulse: {
+                '0%, 80%, 100%': { opacity: '0.3', transform: 'scale(0.8)' },
+                '40%': { opacity: '1', transform: 'scale(1.1)' },
+              },
+              appOpen: {
+                '0%': { opacity: '0', transform: 'translateY(8%) scale(0.95)' },
+                '100%': { opacity: '1', transform: 'translateY(0) scale(1)' },
+              },
+              notifPop: {
+                '0%': { opacity: '0', transform: 'translateY(-130%)' },
+                '70%': { opacity: '1', transform: 'translateY(6%)' },
+                '100%': { opacity: '1', transform: 'translateY(0)' },
+              },
+            }
+          }
+        }
+      }
+    </script>
+    <style>
+      :root {
+        --primary-hue: 245; 
+        --primary-sat: 25%;
+        --primary-lightness: 65%;
+        /* 安全区单一来源：原生 env 与 JS 探测值 --standalone-safe-area-*（见 utils/iosStandalone.ts）取大，
+           iOS 全屏 PWA 下原生 env 偶发返回 0 时由探测值兜底。新增 App 一律引用这三个变量。 */
+        --safe-top: max(env(safe-area-inset-top, 0px), var(--standalone-safe-area-top, 0px));
+        --safe-bottom: max(env(safe-area-inset-bottom, 0px), var(--standalone-safe-area-bottom, 0px));
+        /* 全屏界面顶栏让开「安全区 + SullyOS 顶部状态栏(时间/电量, 约 1.5rem)」；背景仍铺满，只挪控件。 */
+        --chrome-top: calc(var(--safe-top) + 1.5rem);
+        --app-height: 100lvh;
+        --keyboard-inset: 0px;
+        --app-font: 'Quicksand', sans-serif;
+      }
+      /* 动森风格皮肤：拉丁/数字用 Nunito（圆润），中文用 ZCOOL KuaiLe（可爱），保留 Noto Sans SC 兜底。
+         选择 html[data-skin] 而非 :root，优先级更高，能盖过运行时注入的 --app-font。 */
+      html[data-skin="animalcrossing"] {
+        --app-font: 'Nunito', 'ZCOOL KuaiLe', 'Noto Sans SC', sans-serif;
+      }
+      html, body, #root {
+        width: 100%;
+        min-height: var(--app-height, 100lvh);
+        height: var(--app-height, 100lvh);
+      }
+      body {
+        background-color: #0f1115;
+        color: #0f172a;
+        color-scheme: light;
+        margin: 0;
+        overflow: hidden;
+        /* Critical: Prevent browser back/forward swipe navigation AND vertical rubber-banding */
+        overscroll-behavior: none;
+        /* Prevent text selection to feel like an app */
+        user-select: none;
+        -webkit-user-select: none;
+        height: var(--app-height);
+        min-height: var(--app-height);
+        width: 100vw;
+        font-family: var(--app-font);
+      }
+      /* 顶部时钟/电量条被隐藏时（外观开关或平台默认，由 PhoneShell 切换 .sully-statusbar-hidden），
+         chrome-top 不再需要那 1.5rem 状态栏预留，退化成 safe-top，
+         避免用 --chrome-top 让位的顶栏（交换日记/彼方/剧场等）顶部多留空白。 */
+      html.sully-statusbar-hidden {
+        --chrome-top: var(--safe-top);
+      }
+      /* 紧凑显示：时间/电量嵌入安全区左右两侧，App 顶栏从安全区底部开始。
+         无刘海设备仍至少留 1.5rem 给时间栏；有灵动岛时不把按钮顶进遮挡区。 */
+      html.sully-statusbar-compact {
+        --chrome-top: max(var(--safe-top), 1.5rem);
+      }
+      /* 外壳本身可多画一段 home 安全区，但不能因此把根页面变成可拖动的滚动容器。 */
+      html.ios-standalone {
+        height: var(--app-visible-height, 100dvh);
+        min-height: 0;
+        overflow: hidden;
+        overscroll-behavior: none;
+      }
+      body.ios-standalone {
+        min-height: var(--app-height);
+        height: var(--app-height);
+        overscroll-behavior: none;
+      }
+      body.ios-standalone #root {
+        min-height: var(--app-height);
+        height: var(--app-height);
+      }
+      /* Global scroll behavior fix */
+      .no-overscroll {
+        overscroll-behavior: none;
+      }
+      .overscroll-contain {
+        overscroll-behavior: contain;
+      }
+      /* Re-enable selection for inputs */
+      input, textarea {
+        user-select: text;
+        -webkit-user-select: text;
+      }
+      .no-scrollbar::-webkit-scrollbar {
+        display: none;
+      }
+      .no-scrollbar {
+        -ms-overflow-style: none;
+        scrollbar-width: none;
+      }
+      /* 默认细滚动条：盖掉浏览器又粗又灰的原生滚动条（.no-scrollbar 仍可隐藏） */
+      *::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+      }
+      *::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      *::-webkit-scrollbar-thumb {
+        background: rgba(140, 140, 160, 0.3);
+        border-radius: 999px;
+      }
+      *::-webkit-scrollbar-thumb:hover {
+        background: rgba(140, 140, 160, 0.5);
+      }
+      /* 阅读器细滚动条（明暗主题通用，半透明） */
+      .vr-reader-scroll {
+        scrollbar-width: thin;
+        scrollbar-color: rgba(140,140,140,0.35) transparent;
+      }
+      .vr-reader-scroll::-webkit-scrollbar {
+        width: 5px;
+      }
+      .vr-reader-scroll::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      .vr-reader-scroll::-webkit-scrollbar-thumb {
+        background: rgba(140,140,140,0.35);
+        border-radius: 999px;
+      }
+      .vr-reader-scroll::-webkit-scrollbar-thumb:hover {
+        background: rgba(140,140,140,0.55);
+      }
+      input:focus, textarea:focus, select:focus {
+        outline: none;
+      }
+      /* Utility for Safe Area —— 统一引用单一来源变量 */
+      .pb-safe {
+        padding-bottom: var(--safe-bottom);
+      }
+      /* 软键盘弹出时（iosStandalone 在 body 上挂 .ios-keyboard-open），收掉底部给 home 条留的 safe 间隙，
+         让聊天输入栏直接贴住键盘：① 外壳容器不再把底边钉在 safe 上方，铺到可视区底；② 输入栏收掉自己的 pb-safe 白条。
+         键盘收起后 class 移除，两者各自回到 safe 让位。app 高度跟随可视区由 utils/iosStandalone.ts 处理。
+         （外壳 bottom 用 !important 盖过 PhoneShell 给它设的 inline style。） */
+      .sully-chat-inputbar {
+        transition: padding-bottom 0.18s ease-out;
+      }
+      /* With contain, WebKit extends the shell backing into the native bar.
+         Match the visible header instead of extending the fallback pink gradient. */
+      html[data-ios-status-bar-contained] .sully-phone-shell {
+        background: var(--ios-status-bar-color, #0f1115);
+      }
+
+      body.ios-keyboard-open .sully-shell-content {
+        bottom: 0 !important;
+      }
+      body.ios-keyboard-open .sully-chat-inputbar {
+        padding-bottom: 0;
+      }
+      /* 通话页：键盘弹起时收起大头像英雄区（约 300px），把可视区让给消息列表 + 输入框。
+         可视区收到键盘上方后若不收起大头像，会把输入框顶出可视区。用 max-height 过渡平滑收起。 */
+      .sully-call-hero {
+        transition: max-height 0.2s ease-out, opacity 0.2s ease-out, padding 0.2s ease-out;
+        max-height: 420px;
+      }
+      body.ios-keyboard-open .sully-call-hero {
+        max-height: 0;
+        opacity: 0;
+        padding-top: 0;
+        padding-bottom: 0;
+        overflow: hidden;
+        pointer-events: none;
+      }
+      /* Gecko 渲染引擎与系统「减弱透明度」偏好下统一关闭实时背景采样模糊与滚动容器内的投影滤镜，
+         避免高分屏滚动时逐帧重算高斯模糊导致掉帧；各卡片与导航栏由组件同步提供高对比度半透纯色底。 */
+      html[data-reduced-blur] *,
+      html[data-reduced-blur] *::before,
+      html[data-reduced-blur] *::after {
+        -webkit-backdrop-filter: none !important;
+        backdrop-filter: none !important;
+      }
+      html[data-reduced-blur] .launcher-desktop [class*="drop-shadow"],
+      html[data-reduced-blur] .sully-chat-root [class*="drop-shadow"] {
+        filter: none !important;
+      }
+      @media (prefers-reduced-transparency: reduce) {
+        *, *::before, *::after {
+          -webkit-backdrop-filter: none !important;
+          backdrop-filter: none !important;
+        }
+        .launcher-desktop [class*="drop-shadow"],
+        .sully-chat-root [class*="drop-shadow"] {
+          filter: none !important;
+        }
+      }
+      @supports (-moz-appearance: none) {
+        *, *::before, *::after {
+          -webkit-backdrop-filter: none !important;
+          backdrop-filter: none !important;
+        }
+        .launcher-desktop [class*="drop-shadow"],
+        .sully-chat-root [class*="drop-shadow"] {
+          filter: none !important;
+        }
+      }
+    </style>
+    <script>
+      (function () {
+        var ua = navigator.userAgent || '';
+        var gecko = /\bGecko\/\d/i.test(ua) && !/\blike Gecko\b/i.test(ua);
+        var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-transparency: reduce)').matches;
+        if (gecko || reduced) document.documentElement.setAttribute('data-reduced-blur', '');
+      })();
+    </script>
+
+  <script type="importmap">
+{
+  "imports": {
+    "katex": "https://esm.sh/katex@0.16.9"
+  }
+}
+</script>
+  <script type="module" crossorigin src="/assets/build/main-D05avGxA.js"></script>
+  <link rel="modulepreload" crossorigin href="/assets/build/vendor-capacitor-DtNwoD35.js">
+  <link rel="modulepreload" crossorigin href="/assets/build/vendor-react-BoKvikiE.js">
+  <link rel="modulepreload" crossorigin href="/assets/build/vendor-blob-store-t5gmMSH4.js">
+  <link rel="modulepreload" crossorigin href="/assets/build/useLocalBackHandler-5SZnNJaa.js">
+  <link rel="modulepreload" crossorigin href="/assets/build/friendFeed-DvSImPmy.js">
+  <link rel="modulepreload" crossorigin href="/assets/build/vendor-C7jFqhk5.js">
+  <link rel="modulepreload" crossorigin href="/assets/build/userLocation-BLEUzU7P.js">
+  <link rel="modulepreload" crossorigin href="/assets/build/cssImageAssets-j-rBW-tu.js">
+  <link rel="modulepreload" crossorigin href="/assets/build/spaceAssets-j5Ox2Tgc.js">
+  <link rel="stylesheet" crossorigin href="/assets/build/main-BIgKc_dU.css">
+</head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

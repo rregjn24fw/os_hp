@@ -1,0 +1,1 @@
+const r=(o,t)=>{const e=Number(o);return Number.isFinite(e)?Math.max(0,e):t},i=o=>{const t=r(o.borderRadius,20);return{topLeft:r(o.borderTopLeftRadius,t),topRight:r(o.borderTopRightRadius,t),bottomRight:r(o.borderBottomRightRadius,t),bottomLeft:r(o.borderBottomLeftRadius,t)}},s=(o,t)=>o==="none"||o==="last"&&!t;export{i as r,s};

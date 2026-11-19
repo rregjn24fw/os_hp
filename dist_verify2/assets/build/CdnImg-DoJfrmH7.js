@@ -1,0 +1,1 @@
+import{ck as m,au as n}from"./vendor-react-BoKvikiE.js";import{dC as f,kJ as x}from"./main-Bgl7O6eM.js";const g=({path:s,src:e,onError:t,...u})=>{const r=m.useMemo(()=>s?f(s):e?x(e):[],[s,e]),[i,o]=m.useState(0);return m.useEffect(()=>{o(0)},[r[0]]),n.jsx("img",{src:r[i]??void 0,...u,onError:a=>{i<r.length-1?o(i+1):t==null||t(a)}})};export{g as C};
